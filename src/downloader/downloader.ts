@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type * as cliProgress from 'cli-progress';
+import { embedAudioTracks } from '../audio/embed';
 import { checkVideoFileExists, getVideoId, saveVideoProgress } from '../csv/progress';
 import { embedSubtitles } from '../subtitles/embed';
 import type { VideoData } from '../types';
@@ -112,7 +113,8 @@ export async function downloadVideo(
 			fs.mkdirSync(finalDir, { recursive: true });
 		}
 
-		const fileName = `${courseTitle} - U${unitNumber} - ${index}_${vData.title.trimEnd()}`;
+		const sanitize = (s: string) => s.replace(/[\\/:*?"<>|]/g, '_').trimEnd();
+		const fileName = `${sanitize(courseTitle ?? 'Unknown Course')} - U${unitNumber} - ${index}_${sanitize(vData.title)}`;
 
 		let downloadSuccess = false;
 		const N_M3U8DL_RE = getN3u8DLPath();
@@ -131,6 +133,7 @@ export async function downloadVideo(
 				'.tmp',
 				'--log-level',
 				'INFO', // Keep INFO to get progress output for parsing
+				...(subtitle_langs?.length ? ['--select-audio', `lang=${subtitle_langs.join('|')}:for=best`] : []),
 			];
 
 			await executeWithProgress(N_M3U8DL_RE, args1080p, vData.title, multiBar);
@@ -149,6 +152,7 @@ export async function downloadVideo(
 				'.tmp',
 				'--log-level',
 				'INFO', // Keep INFO to get progress output for parsing
+				...(subtitle_langs?.length ? ['--select-audio', `lang=${subtitle_langs.join('|')}:for=best`] : []),
 			];
 
 			await executeWithProgress(N_M3U8DL_RE, argsBest, vData.title, multiBar);
@@ -295,32 +299,54 @@ export async function downloadVideo(
 					);
 				}
 
-				// Embed all subtitles if any were found
-				if (subtitlePaths.length > 0) {
-					const videoPath = path.join(finalDir, `${fileName}.mp4`);
+				// Find the video file (shared by subtitle and audio embedding)
+				const videoPath = path.join(finalDir, `${fileName}.mp4`);
 
-					// Verify video file exists
-					let actualVideoPath: string | null = null;
-					if (fs.existsSync(videoPath)) {
-						actualVideoPath = videoPath;
-					} else {
-						// Try to find the actual video file (might have different extension)
-						const videoFiles = fs
-							.readdirSync(finalDir)
-							.filter(
-								(f) =>
-									f.startsWith(fileName) &&
-									(f.endsWith('.mp4') || f.endsWith('.m3u8') || f.endsWith('.ts'))
-							);
-						if (videoFiles.length > 0) {
-							actualVideoPath = path.join(finalDir, videoFiles[0]);
-						}
+				// Verify video file exists
+				let actualVideoPath: string | null = null;
+				if (fs.existsSync(videoPath)) {
+					actualVideoPath = videoPath;
+				} else {
+					// Try to find the actual video file (might have different extension)
+					const videoFiles = fs
+						.readdirSync(finalDir)
+						.filter(
+							(f) =>
+								f.startsWith(fileName) &&
+								(f.endsWith('.mp4') || f.endsWith('.m3u8') || f.endsWith('.ts'))
+						);
+					if (videoFiles.length > 0) {
+						actualVideoPath = path.join(finalDir, videoFiles[0]);
+					}
+				}
+
+				if (actualVideoPath) {
+					// Wait for file to be fully written before embedding subtitles
+					await waitForFileComplete(actualVideoPath);
+
+					// Embed subtitles if any were found
+					if (subtitlePaths.length > 0) {
+						await embedSubtitles(actualVideoPath, subtitlePaths, multiBar, vData.title);
 					}
 
-					if (actualVideoPath) {
-						// Wait for file to be fully written before embedding subtitles
-						await waitForFileComplete(actualVideoPath);
-						await embedSubtitles(actualVideoPath, subtitlePaths, multiBar, vData.title);
+					// Find and embed downloaded audio tracks (.m4a files)
+					const m4aFiles = fs
+						.readdirSync(finalDir)
+						.filter((f) => f.startsWith(fileName) && f.endsWith('.m4a'));
+
+					if (m4aFiles.length > 0) {
+						const audioPaths = m4aFiles.map((f) => ({
+							lang: f.replace(`${fileName}.`, '').replace('.m4a', ''),
+							path: path.join(finalDir, f),
+						}));
+						const singleLangAsDefault = subtitle_langs.length === 1;
+						await embedAudioTracks(
+							actualVideoPath,
+							audioPaths,
+							singleLangAsDefault,
+							multiBar,
+							vData.title
+						);
 					}
 				}
 			}

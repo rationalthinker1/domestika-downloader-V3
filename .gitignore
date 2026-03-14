@@ -17,6 +17,10 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
+yarn.lock
+.yarn/
+.yarnrc
+.yarnrc.yml
 
 # System files
 .DS_Store
@@ -26,6 +30,8 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+course-metadata-cache.json
+my_courses/
 
 # Progress and input files (runtime)
 progress.csv
