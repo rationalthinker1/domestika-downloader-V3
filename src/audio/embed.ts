@@ -2,7 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type * as cliProgress from 'cli-progress';
 import { getLanguageCode } from '../subtitles/language';
-import { debugLog, log, logError } from '../utils/debug';
+import { debugLog } from '../utils/debug';
+import { logger } from '../utils/logger';
 import { spawnPromise } from '../utils/process';
 
 /**
@@ -25,7 +26,7 @@ export async function embedAudioTracks(
 ): Promise<boolean> {
 	try {
 		if (!fs.existsSync(videoPath)) {
-			logError(`Error: Video file not found: ${videoPath}`, multiBar);
+			logger.error(`Video file not found: ${videoPath}`, multiBar);
 			return false;
 		}
 
@@ -34,7 +35,7 @@ export async function embedAudioTracks(
 		);
 
 		if (validAudioPaths.length === 0) {
-			logError('Error: No valid audio files found', multiBar);
+			logger.error('No valid audio files found', multiBar);
 			return false;
 		}
 
@@ -89,7 +90,7 @@ export async function embedAudioTracks(
 		await spawnPromise('ffmpeg', ffmpegArgs);
 
 		if (!fs.existsSync(outputPath)) {
-			logError(`Error: Output file not created: ${outputPath}`, multiBar);
+			logger.error(`Output file not created: ${outputPath}`, multiBar);
 			return false;
 		}
 
@@ -97,7 +98,7 @@ export async function embedAudioTracks(
 		fs.renameSync(outputPath, videoPath);
 
 		const videoName = videoTitle ? ` for ${videoTitle}` : '';
-		log(`Embedded ${validAudioPaths.length} audio track(s)${videoName}`, multiBar);
+		logger.success(`Audio embedded (${validAudioPaths.length} track(s))${videoName}`, multiBar);
 
 		for (const audio of validAudioPaths) {
 			try {
@@ -111,7 +112,7 @@ export async function embedAudioTracks(
 		return true;
 	} catch (error) {
 		const err = error as Error;
-		logError(`Error embedding audio tracks: ${err.message}`, multiBar);
+		logger.error(`Error embedding audio tracks: ${err.message}`, multiBar);
 		return false;
 	}
 }

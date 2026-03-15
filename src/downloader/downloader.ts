@@ -5,7 +5,8 @@ import { embedAudioTracks } from '../audio/embed';
 import { checkVideoFileExists, getVideoId, saveVideoProgress } from '../csv/progress';
 import { embedSubtitles } from '../subtitles/embed';
 import type { VideoData } from '../types';
-import { debugLog, log } from '../utils/debug';
+import { debugLog } from '../utils/debug';
+import { logger } from '../utils/logger';
 import { ensureDir, findSubtitleFile, findVideoFile, waitForFileStable } from '../utils/fs';
 import { getDownloadPath, getN3u8DLPath } from '../utils/paths';
 import { spawnPromise } from '../utils/process';
@@ -103,11 +104,11 @@ async function downloadSubtitleForLang(
 			return { lang, success: true, path: subPath };
 		}
 
-		log(`⚠️  ${lang.toUpperCase()} subtitles downloaded but file not found`, multiBar);
+		logger.warn(`${lang.toUpperCase()} subtitles downloaded but file not found`, multiBar);
 		return { lang, success: false, error: 'Subtitle file not found after download' };
 	} catch (err) {
 		const error = err as Error;
-		log(`⚠️  Failed to download ${lang.toUpperCase()} subtitles: ${error.message}`, multiBar);
+		logger.warn(`Failed to download ${lang.toUpperCase()} subtitles: ${error.message}`, multiBar);
 		debugLog(`[SUBTITLE] Error details for ${lang}: ${error.stack}`);
 		return { lang, success: false, error: error.message };
 	}
@@ -132,11 +133,8 @@ async function downloadSubtitlesForVideo(
 	const succeeded = results.filter((r) => r.success);
 	const failed = results.filter((r) => !r.success);
 
-	if (succeeded.length > 0) {
-		log(`✅ Downloaded ${succeeded.length} subtitle language(s)`, multiBar);
-	}
 	if (failed.length > 0) {
-		log(`⚠️  Failed ${failed.length} subtitle language(s): ${failed.map((f) => f.lang).join(', ')}`, multiBar);
+		logger.warn(`Failed ${failed.length} subtitle language(s): ${failed.map((f) => f.lang).join(', ')}`, multiBar);
 	}
 
 	return succeeded.map((r) => r.path as string);

@@ -7,7 +7,8 @@ import domestikaAuth from '../auth';
 import { isVideoCompleted } from '../csv/progress';
 import { downloadVideo } from '../downloader/downloader';
 import type { DownloadOption, Unit, VideoData, VideoSelection } from '../types';
-import { debugLog, logError, logMemoryUsage, setActiveMultiBar } from '../utils/debug';
+import { debugLog, logMemoryUsage, setActiveMultiBar } from '../utils/debug';
+import { logger } from '../utils/logger';
 import { getEnvInt } from '../utils/env';
 import { sanitizeTitle } from '../utils/strings';
 import { loadCourseMetadata, saveCourseMetadata } from './cache';
@@ -17,6 +18,114 @@ interface DownloadTask {
 	video: VideoData;
 	unit: Unit;
 	videoIndex: number;
+}
+
+async function downloadSpecificVideos(
+	allVideos: Unit[],
+	courseUrl: string,
+	courseTitle: string | null,
+	subtitleLangs: string[] | null,
+	completedVideos: Set<string>
+): Promise<void> {
+	const videoChoices = allVideos.flatMap((unit) => {
+		const unitHeader = {
+			name: `Unit ${unit.unitNumber}: ${unit.title}`,
+			value: `unit_${unit.unitNumber}`,
+			checked: false,
+		};
+
+		const unitVideos = unit.videoData.map((video, index) => ({
+			name: `    ${index + 1}. ${video.title}`,
+			value: {
+				unit: unit,
+				videoData: video,
+				index: index + 1,
+			},
+			short: video.title,
+		}));
+
+		return [unitHeader, ...unitVideos];
+	});
+
+	const selectedVideos = await inquirer.prompt<{ videosToDownload: (string | VideoSelection)[] }>(
+		[
+			{
+				type: 'checkbox',
+				name: 'videosToDownload',
+				message: 'Select complete units or specific videos:',
+				choices: videoChoices,
+				pageSize: 20,
+				loop: false,
+			},
+		]
+	);
+
+	for (const selection of selectedVideos.videosToDownload) {
+		if (typeof selection === 'string' && selection.startsWith('unit_')) {
+			const unitNumber = Number.parseInt(selection.split('_')[1], 10);
+			const unit = allVideos.find((u) => u.unitNumber === unitNumber);
+
+			if (unit) {
+				for (let i = 0; i < unit.videoData.length; i++) {
+					const videoIndex = i + 1;
+					const video = unit.videoData[i];
+					if (
+						await isVideoCompleted(
+							courseUrl,
+							unit.unitNumber,
+							videoIndex,
+							completedVideos,
+							courseTitle,
+							unit.title,
+							video.title,
+							video.section
+						)
+					) {
+						logger.skip(`Already downloaded: ${video.title}`);
+						continue;
+					}
+					await downloadVideo(
+						video,
+						courseTitle,
+						unit.title,
+						videoIndex,
+						subtitleLangs,
+						unit.unitNumber,
+						undefined,
+						courseUrl,
+						completedVideos
+					);
+				}
+			}
+		} else if (typeof selection === 'object' && 'videoData' in selection) {
+			if (
+				await isVideoCompleted(
+					courseUrl,
+					selection.unit.unitNumber,
+					selection.index,
+					completedVideos,
+					courseTitle,
+					selection.unit.title,
+					selection.videoData.title,
+					selection.videoData.section
+				)
+			) {
+				logger.skip(`Already downloaded: ${selection.videoData.title}`);
+			} else {
+				await downloadVideo(
+					selection.videoData,
+					courseTitle,
+					selection.unit.title,
+					selection.index,
+					subtitleLangs,
+					selection.unit.unitNumber,
+					undefined,
+					courseUrl,
+					completedVideos
+				);
+			}
+		}
+	}
 }
 
 function getMultiSectionUnits($: cheerio.CheerioAPI) {
@@ -128,8 +237,8 @@ export async function scrapeSite(
 	if (cachedMetadata) {
 		debugLog(`[CACHE] Using cached metadata for course: ${courseUrl}`);
 		allVideos = cachedMetadata;
-		console.log(`Course: ${courseTitle}`);
-		console.log(`${allVideos.length} Units loaded from cache`);
+		logger.info(`Course: ${courseTitle}`);
+		logger.info(`${allVideos.length} units loaded from cache`);
 	} else {
 		debugLog(`[CACHE] Cache miss or expired for course: ${courseUrl}`);
 
@@ -160,10 +269,14 @@ export async function scrapeSite(
 		const html = await page.content();
 		const $ = cheerio.load(html);
 
-		console.log('Analyzing site');
+		logger.step('Analyzing site...');
 
 		const multiUnits = getMultiSectionUnits($);
+		logger.info(`Found ${multiUnits.length} multi-section units`);
+
 		const singleUnits = getSingleSectionUnits($);
+		logger.info(`Found ${singleUnits.length} single-section units`);
+
 
 		if (multiUnits.length > 0) {
 			allVideos = await getVideoFilesFromMultiSection(multiUnits, $, page);
@@ -171,7 +284,7 @@ export async function scrapeSite(
 			allVideos = await getVideoFilesFromSingleSection(singleUnits, $, page);
 		} else {
 			await closeBrowser(page, requestHandler, browser);
-			console.log('\n❌ No videos found. This may be due to invalid cookies.');
+			logger.error('No videos found. This may be due to invalid cookies.');
 			await promptCookieRefreshAndRetry(
 				courseUrl,
 				subtitleLangs,
@@ -182,8 +295,8 @@ export async function scrapeSite(
 			throw new Error('Cannot download videos without valid cookies.');
 		}
 
-		console.log(`Course: ${courseTitle}`);
-		console.log(`${allVideos.length} Units detected`);
+		logger.info(`Course: ${courseTitle}`);
+		logger.info(`${allVideos.length} units detected`);
 
 		saveCourseMetadata(courseUrl, allVideos, courseTitle);
 		debugLog(`[CACHE] Saved metadata to cache for course: ${courseUrl}`);
@@ -192,110 +305,21 @@ export async function scrapeSite(
 	}
 
 	if (downloadOption === 'specific') {
-		const videoChoices = allVideos.flatMap((unit) => {
-			const unitHeader = {
-				name: `Unit ${unit.unitNumber}: ${unit.title}`,
-				value: `unit_${unit.unitNumber}`,
-				checked: false,
-			};
-
-			const unitVideos = unit.videoData.map((video, index) => ({
-				name: `    ${index + 1}. ${video.title}`,
-				value: {
-					unit: unit,
-					videoData: video,
-					index: index + 1,
-				},
-				short: video.title,
-			}));
-
-			return [unitHeader, ...unitVideos];
-		});
-
-		const selectedVideos = await inquirer.prompt<{ videosToDownload: (string | VideoSelection)[] }>(
-			[
-				{
-					type: 'checkbox',
-					name: 'videosToDownload',
-					message: 'Select complete units or specific videos:',
-					choices: videoChoices,
-					pageSize: 20,
-					loop: false,
-				},
-			]
-		);
-
-		for (const selection of selectedVideos.videosToDownload) {
-			if (typeof selection === 'string' && selection.startsWith('unit_')) {
-				const unitNumber = Number.parseInt(selection.split('_')[1], 10);
-				const unit = allVideos.find((u) => u.unitNumber === unitNumber);
-
-				if (unit) {
-					for (let i = 0; i < unit.videoData.length; i++) {
-						const videoIndex = i + 1;
-						const video = unit.videoData[i];
-						if (
-							await isVideoCompleted(
-								courseUrl,
-								unit.unitNumber,
-								videoIndex,
-								completedVideos,
-								courseTitle,
-								unit.title,
-								video.title,
-								video.section
-							)
-						) {
-							console.log(`⏭️  Skipping already downloaded: ${video.title}`);
-							continue;
-						}
-						await downloadVideo(
-							video,
-							courseTitle,
-							unit.title,
-							videoIndex,
-							subtitleLangs,
-							unit.unitNumber,
-							undefined,
-							courseUrl,
-							completedVideos
-						);
-					}
-				}
-			} else if (typeof selection === 'object' && 'videoData' in selection) {
-				if (
-					await isVideoCompleted(
-						courseUrl,
-						selection.unit.unitNumber,
-						selection.index,
-						completedVideos,
-						courseTitle,
-						selection.unit.title,
-						selection.videoData.title,
-						selection.videoData.section
-					)
-				) {
-					console.log(`⏭️  Skipping already downloaded: ${selection.videoData.title}`);
-				} else {
-					await downloadVideo(
-						selection.videoData,
-						courseTitle,
-						selection.unit.title,
-						selection.index,
-						subtitleLangs,
-						selection.unit.unitNumber,
-						undefined,
-						courseUrl,
-						completedVideos
-					);
-				}
-			}
-		}
-		return;
+		await downloadSpecificVideos(allVideos, courseUrl, courseTitle, subtitleLangs, completedVideos);
+	} else {
+		await downloadAllVideos(allVideos, courseUrl, courseTitle, subtitleLangs, completedVideos, downloadOption);
 	}
+}
 
-	// If we reach here it's because downloadOption === 'all'
-	console.log('Downloading entire course...');
+async function downloadAllVideos(
+	allVideos: Unit[],
+	courseUrl: string,
+	courseTitle: string | null,
+	subtitleLangs: string[] | null,
+	completedVideos: Set<string>,
+	downloadOption: DownloadOption
+): Promise<void> {
+	logger.step('Downloading entire course...');
 	let downloadedCount = 0;
 	let skippedCount = 0;
 
@@ -322,7 +346,7 @@ export async function scrapeSite(
 		for (let i = 0; i < unit.videoData.length; i++) {
 			const video = unit.videoData[i];
 			if (!video?.playbackURL) {
-				logError(`Error: Invalid video data for ${unit.title} #${i}`, multiBar);
+				logger.error(`Invalid video data for ${unit.title} #${i}`, multiBar);
 				continue;
 			}
 
@@ -348,7 +372,7 @@ export async function scrapeSite(
 	}
 
 	if (skippedCount > 0) {
-		console.log(`⏭️  Skipping ${skippedCount} already downloaded video(s)`);
+		logger.skip(`${skippedCount} already downloaded video(s) skipped`);
 	}
 
 	const MAX_CONCURRENT_DOWNLOADS = getEnvInt('MAX_CONCURRENT_DOWNLOADS', 2);
@@ -390,7 +414,7 @@ export async function scrapeSite(
 				}
 			} catch (error) {
 				const err = error as Error;
-				logError(`❌ Error in video ${task.video.title}: ${err.message}`, multiBar);
+				logger.error(`Error in video ${task.video.title}: ${err.message}`, multiBar);
 				processedCount++;
 			}
 		})();
@@ -408,12 +432,10 @@ export async function scrapeSite(
 	setActiveMultiBar(null);
 	logMemoryUsage('After all downloads completed');
 
-	console.log(
-		`\n✅ Download summary: ${downloadedCount} new video(s) downloaded, ${skippedCount} already downloaded`
-	);
+	logger.success(`Download summary: ${downloadedCount} new, ${skippedCount} skipped`);
 
 	if (downloadedCount === 0 && skippedCount === 0) {
-		console.log('\n❌ Could not download any videos. This may be due to invalid cookies.');
+		logger.error('Could not download any videos. This may be due to invalid cookies.');
 		await promptCookieRefreshAndRetry(
 			courseUrl,
 			subtitleLangs,

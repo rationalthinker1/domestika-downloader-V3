@@ -15,20 +15,6 @@ interface InitialProps {
 	sectionTitle?: string;
 }
 
-function mapVideos(videos: InitialPropsVideo[], section: string): VideoData[] {
-	return videos.flatMap((el) => {
-		if (!el?.video?.playbackURL || !el?.video?.title) return [];
-		debugLog(`Video found: ${el.video.title}`);
-		return [
-			{
-				playbackURL: el.video.playbackURL,
-				title: sanitizeTitle(el.video.title),
-				section,
-			},
-		];
-	});
-}
-
 export async function fetchUnitVideoData(url: string, page: Page): Promise<VideoData[]> {
 	await page.goto(url);
 
@@ -50,5 +36,13 @@ export async function fetchUnitVideoData(url: string, page: Page): Promise<Video
 		return [];
 	}
 
-	return mapVideos(initialProps.videos, sanitizedSection);
+	return initialProps.videos.flatMap((el) => {
+		if (!el?.video?.playbackURL || !el?.video?.title) return [];
+		debugLog(`Video found: ${el.video.title}`);
+		return [{
+			playbackURL: el.video.playbackURL,
+			title: sanitizeTitle(el.video.title),
+			section: sanitizedSection
+		}];
+	});
 }

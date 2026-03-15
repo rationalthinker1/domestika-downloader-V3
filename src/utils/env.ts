@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { logger } from './logger';
 
 /**
  * Reads an environment variable as an integer.
@@ -80,6 +81,6 @@ export function updateEnvFile(filePath: string, updates: Record<string, string>)
 	try {
 		fs.writeFileSync(filePath, newLines.join('\n'), 'utf8');
 	} catch (err) {
-		console.warn(`Warning: Could not write ${filePath}: ${(err as Error).message}`);
+		logger.warn(`Could not write ${filePath}: ${(err as Error).message}`);
 	}
 }

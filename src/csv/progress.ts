@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { parse as csvParseSync } from 'csv-parse/sync';
 import { stringify as csvStringifySync } from 'csv-stringify/sync';
 import { debugLog } from '../utils/debug';
+import { logger } from '../utils/logger';
 import { VIDEO_EXTENSIONS } from '../utils/fs';
 import { getDownloadPath } from '../utils/paths';
 import { normalizeDomestikaUrl } from '../utils/url';
@@ -65,7 +66,7 @@ export function loadProgress(): Set<string> {
 		return completed;
 	} catch (error) {
 		const err = error as Error;
-		console.warn(`Warning: Could not read progress.csv: ${err.message}`);
+		logger.warn(`Could not read progress.csv: ${err.message}`);
 		return new Set<string>();
 	}
 }
@@ -233,7 +234,7 @@ export function saveVideoProgress(
 		writtenVideoIds.add(videoId);
 	} catch (error) {
 		const err = error as Error;
-		console.error(`Error writing progress.csv: ${err.message}`);
+		logger.error(`Error writing progress.csv: ${err.message}`);
 	}
 }
 
@@ -258,7 +259,7 @@ export function saveProgress(
 			}) as Record<string, string>[];
 		} catch (error) {
 			const err = error as Error;
-			console.warn(`Warning: Could not read existing progress.csv: ${err.message}`);
+			logger.warn(`Could not read existing progress.csv: ${err.message}`);
 		}
 	}
 
@@ -322,6 +323,6 @@ export function saveProgress(
 		fs.writeFileSync(progressFile, csvContent, 'utf-8');
 	} catch (error) {
 		const err = error as Error;
-		console.error(`Error writing progress.csv: ${err.message}`);
+		logger.error(`Error writing progress.csv: ${err.message}`);
 	}
 }

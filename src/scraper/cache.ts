@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Unit } from '../types';
 import { getEnvBool, getEnvInt } from '../utils/env';
+import { logger } from '../utils/logger';
 import { normalizeDomestikaUrl } from '../utils/url';
 
 interface CachedCourse {
@@ -36,7 +37,7 @@ function loadStore(): CacheStore {
 		memoryCache = JSON.parse(content) as CacheStore;
 		return memoryCache;
 	} catch (err) {
-		console.warn(`Warning: Could not read cache file: ${(err as Error).message}`);
+		logger.warn(`Could not read cache file: ${(err as Error).message}`);
 		memoryCache = {};
 		return memoryCache;
 	}
@@ -46,7 +47,7 @@ function persistStore(store: CacheStore): void {
 	try {
 		fs.writeFileSync(CACHE_FILE, JSON.stringify(store, null, 2), 'utf-8');
 	} catch (err) {
-		console.warn(`Warning: Could not write cache file: ${(err as Error).message}`);
+		logger.warn(`Could not write cache file: ${(err as Error).message}`);
 	}
 }
 

@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type * as cliProgress from 'cli-progress';
-import { debugLog, log, logError } from '../utils/debug';
+import { debugLog } from '../utils/debug';
+import { logger } from '../utils/logger';
 import { waitForFileStable } from '../utils/fs';
 import { spawnPromise } from '../utils/process';
 import { getLanguageCode } from './language';
@@ -15,7 +16,7 @@ export async function embedSubtitles(
 	try {
 		// Verify files exist
 		if (!fs.existsSync(videoPath)) {
-			logError(`Error: Video file not found: ${videoPath}`, multiBar);
+			logger.error(`Video file not found: ${videoPath}`, multiBar);
 			return false;
 		}
 
@@ -23,7 +24,7 @@ export async function embedSubtitles(
 		await waitForFileStable(videoPath);
 
 		if (!subtitlePaths || subtitlePaths.length === 0) {
-			logError('Error: No subtitle files provided', multiBar);
+			logger.error('No subtitle files provided', multiBar);
 			return false;
 		}
 
@@ -31,14 +32,14 @@ export async function embedSubtitles(
 		const validSubtitlePaths: string[] = [];
 		for (const subPath of subtitlePaths) {
 			if (!fs.existsSync(subPath)) {
-				log(`⚠️  Subtitle file not found: ${subPath}`, multiBar);
+				logger.warn(`Subtitle file not found: ${subPath}`, multiBar);
 				continue;
 			}
 
 			// Check file size
 			const stats = fs.statSync(subPath);
 			if (stats.size === 0) {
-				log(`⚠️  Subtitle file is empty: ${subPath}`, multiBar);
+				logger.warn(`Subtitle file is empty: ${subPath}`, multiBar);
 				continue;
 			}
 
@@ -48,13 +49,13 @@ export async function embedSubtitles(
 				subtitleContent = fs.readFileSync(subPath, 'utf-8');
 			} catch (error) {
 				const err = error as Error;
-				log(`⚠️  Failed to read subtitle file ${subPath}: ${err.message}`, multiBar);
+				logger.warn(`Failed to read subtitle file ${subPath}: ${err.message}`, multiBar);
 				debugLog(`[SUBTITLE] Read error: ${err.stack}`);
 				continue;
 			}
 
 			if (subtitleContent.trim().length === 0) {
-				log(`⚠️  Subtitle file contains only whitespace: ${subPath}`, multiBar);
+				logger.warn(`Subtitle file contains only whitespace: ${subPath}`, multiBar);
 				continue;
 			}
 
@@ -75,7 +76,7 @@ export async function embedSubtitles(
 			});
 
 			if (!hasSequenceNumbers || !hasTimestamps) {
-				log(`⚠️  Subtitle file does not appear to be in valid SRT format: ${subPath}`, multiBar);
+				logger.warn(`Subtitle file not valid SRT: ${subPath}`, multiBar);
 				debugLog(
 					`[SUBTITLE] Validation failed - hasSequenceNumbers: ${hasSequenceNumbers}, hasTimestamps: ${hasTimestamps}`
 				);
@@ -83,7 +84,7 @@ export async function embedSubtitles(
 			}
 
 			if (!hasTextContent) {
-				log(`⚠️  Subtitle file appears to have no actual subtitle text: ${subPath}`, multiBar);
+				logger.warn(`Subtitle file has no text content: ${subPath}`, multiBar);
 				// Still allow it - might be intentional (empty subtitles)
 			}
 
@@ -92,7 +93,7 @@ export async function embedSubtitles(
 		}
 
 		if (validSubtitlePaths.length === 0) {
-			logError('Error: No valid subtitle files found', multiBar);
+			logger.error('No valid subtitle files found', multiBar);
 			return false;
 		}
 
@@ -147,12 +148,11 @@ export async function embedSubtitles(
 			await spawnPromise('ffmpeg', ffmpegArgs);
 		} catch (error) {
 			const err = error as Error;
-			log(`⚠️  First ffmpeg attempt failed: ${err.message}`, multiBar);
+			logger.warn(`ffmpeg attempt failed: ${err.message}`, multiBar);
 			debugLog(`[FFMPEG] First command error: ${err.stack}`);
 			debugLog(`[FFMPEG] Failed command: ${truncatedLog.substring(0, 500)}...`);
 
-			// If the first command fails, try a simpler version
-			log('Trying alternative ffmpeg method...', multiBar);
+			logger.step('Trying alternative ffmpeg method...', multiBar);
 			const altArgs: string[] = ['-i', videoPath];
 			for (const subPath of validSubtitlePaths) {
 				altArgs.push('-i', subPath);
@@ -171,10 +171,10 @@ export async function embedSubtitles(
 
 			try {
 				await spawnPromise('ffmpeg', altArgs);
-				log('✅ Alternative ffmpeg method succeeded', multiBar);
+				logger.success('Alternative ffmpeg method succeeded', multiBar);
 			} catch (altError) {
 				const altErr = altError as Error;
-				logError(`❌ Alternative ffmpeg method also failed: ${altErr.message}`, multiBar);
+				logger.error(`Alternative ffmpeg method also failed: ${altErr.message}`, multiBar);
 				debugLog(`[FFMPEG] Alternative command error: ${altErr.stack}`);
 				throw new Error(`Both ffmpeg attempts failed. Last error: ${altErr.message}`);
 			}
@@ -182,7 +182,7 @@ export async function embedSubtitles(
 
 		// Verify output file was created
 		if (!fs.existsSync(outputPath)) {
-			logError(`Error: Output file was not created: ${outputPath}`, multiBar);
+			logger.error(`Output file was not created: ${outputPath}`, multiBar);
 			return false;
 		}
 
@@ -201,10 +201,7 @@ export async function embedSubtitles(
 		fs.unlinkSync(videoPath);
 		fs.renameSync(outputPath, videoPath);
 		const videoName = videoTitle ? ` for ${videoTitle}` : '';
-		log(
-			`Replaced original video with subtitled version (${validSubtitlePaths.length} track(s))${videoName}`,
-			multiBar
-		);
+		logger.success(`Subtitles embedded (${validSubtitlePaths.length} track(s))${videoName}`, multiBar);
 
 		// Delete all subtitle files after successful embedding
 		const baseFilename = path.basename(videoPath, videoExt);
@@ -240,9 +237,9 @@ export async function embedSubtitles(
 		return true;
 	} catch (error) {
 		const err = error as Error;
-		logError(`Error embedding subtitles: ${err.message}`, multiBar);
+		logger.error(`Error embedding subtitles: ${err.message}`, multiBar);
 		if (err.message.includes('ffmpeg')) {
-			logError('Make sure ffmpeg is installed and available in your PATH', multiBar);
+			logger.error('Make sure ffmpeg is installed and available in your PATH', multiBar);
 		}
 		return false;
 	}

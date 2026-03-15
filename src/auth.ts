@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import inquirer from 'inquirer';
 import 'dotenv/config';
 import { updateEnvFile } from './utils/env';
+import { logger } from './utils/logger';
 
 export interface Cookie {
 	name: string;
@@ -47,13 +48,14 @@ export class DomestikaAuth {
 	}
 
 	async promptForCredentials(forceUpdate = false): Promise<void> {
-		console.log('\n📝 To get your credentials:');
-		console.log('1. Log in to Domestika');
-		console.log('2. Open Developer Tools (F12)');
-		console.log('3. Go to the Storage tab -> Cookies');
-		console.log('4. Find and copy the value of the following cookies:');
-		console.log('   - _domestika_session');
-		console.log('   - _credentials\n');
+		logger.header('Cookie Setup');
+		logger.list([
+			'Log in to Domestika',
+			'Open Developer Tools (F12)',
+			'Go to the Storage tab → Cookies',
+			'Copy the value of: _domestika_session',
+			'Copy the value of: _credentials',
+		]);
 
 		const answers = await inquirer.prompt<{
 			sessionCookie?: string;

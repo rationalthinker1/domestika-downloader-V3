@@ -1,12 +1,12 @@
 import * as fs from 'node:fs';
-import inquirer from 'inquirer';
 import 'dotenv/config';
 import domestikaAuth from './auth';
 import { readInputCSV } from './csv/input';
 import { loadProgress, saveProgress } from './csv/progress';
 import { scrapeSite } from './scraper/scraper';
-import type { CourseToProcess, DownloadOption, InquirerAnswers } from './types';
+import type { CourseToProcess, DownloadOption } from './types';
 import { logMemoryUsage } from './utils/debug';
+import { logger } from './utils/logger';
 import { getN3u8DLPath } from './utils/paths';
 import { parseSubtitleLanguages } from './utils/subtitles';
 import { DOMESTIKA_URL_PATTERN, normalizeDomestikaUrl } from './utils/url';
@@ -41,7 +41,7 @@ function resolveCoursesFromCsv(): CourseToProcess[] {
 	const csvCourses = readInputCSV();
 	if (!csvCourses?.length) return [];
 
-	console.log(`\n📋 Found ${csvCourses.length} courses in input.csv`);
+	logger.info(`Found ${csvCourses.length} courses in input.csv`);
 	return csvCourses.map((course) =>
 		toCourseToProcess(
 			course.url,
@@ -51,65 +51,42 @@ function resolveCoursesFromCsv(): CourseToProcess[] {
 	);
 }
 
-function resolveCoursesFromArgs(): CourseToProcess[] {
+function parseArgs(): { urls?: string; subtitles?: string; download?: string } {
 	const args = process.argv.slice(2);
-	const rawUrls = args[0];
-	const subtitleLangs = parseSubtitleLanguages(args[1] ?? null);
-	const downloadOption = (args[2] ?? 'all') as DownloadOption;
+	const result: { urls?: string; subtitles?: string; download?: string } = {};
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === '--urls' && args[i + 1]) result.urls = args[++i];
+		else if (args[i] === '--subtitles' && args[i + 1]) result.subtitles = args[++i];
+		else if (args[i] === '--download' && args[i + 1]) result.download = args[++i];
+	}
+	return result;
+}
 
-	const urls = rawUrls.trim().split(' ');
+function resolveCoursesFromArgs(): CourseToProcess[] {
+	const { urls: rawUrls, subtitles, download } = parseArgs();
+
+	if (!rawUrls) {
+		throw new Error('--urls is required. Provide one or more Domestika course URLs separated by commas.');
+	}
+
+	const subtitleLangs = parseSubtitleLanguages(subtitles ?? 'en');
+	const downloadOption = (download ?? 'all') as DownloadOption;
+
+	const urls = rawUrls.split(',').map((u) => u.trim()).filter(Boolean);
 	if (!urls.every(isValidDomestikaUrl)) {
 		throw new Error('Please provide valid Domestika course URLs');
 	}
 
-	console.log('Using command-line arguments:');
-	console.log(`  Course URLs: ${rawUrls}`);
-	console.log(`  Subtitles: ${subtitleLangs ? subtitleLangs.join(', ') : 'None'}`);
-	console.log(`  Download Option: ${downloadOption}`);
+	logger.step('Using command-line arguments:');
+	logger.list([
+		`URLs: ${urls.join(', ')}`,
+		`Subtitles: ${subtitleLangs ? subtitleLangs.join(', ') : 'None'}`,
+		`Download: ${downloadOption}`,
+	]);
 
 	return urls.map((url) => toCourseToProcess(url, subtitleLangs, downloadOption));
 }
 
-async function resolveCoursesInteractively(): Promise<CourseToProcess[]> {
-	const answers = await inquirer.prompt<InquirerAnswers>([
-		{
-			type: 'input' as const,
-			name: 'courseUrls',
-			message: 'Course URLs (separated by spaces):',
-			validate: (input: string) => {
-				const urls = input.trim().split(' ');
-				return urls.every(isValidDomestikaUrl) || 'Please enter valid Domestika course URLs';
-			},
-		},
-		{
-			type: 'checkbox' as const,
-			name: 'subtitles',
-			message: 'Select subtitle languages (space to select, enter to confirm):',
-			choices: [
-				{ name: 'Spanish', value: 'es' },
-				{ name: 'English', value: 'en' },
-				{ name: 'Portuguese', value: 'pt' },
-				{ name: 'French', value: 'fr' },
-				{ name: 'German', value: 'de' },
-				{ name: 'Italian', value: 'it' },
-			],
-		},
-		{
-			type: 'list' as const,
-			name: 'downloadOption',
-			message: 'What do you want to download?',
-			choices: [
-				{ name: 'Entire course', value: 'all' },
-				{ name: 'Specific videos', value: 'specific' },
-			],
-		},
-	]);
-
-	const urls = answers.courseUrls.trim().split(' ');
-	const subtitleLangs = answers.subtitles?.length ? answers.subtitles : null;
-
-	return urls.map((url) => toCourseToProcess(url, subtitleLangs, answers.downloadOption));
-}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -117,7 +94,7 @@ async function resolveCoursesInteractively(): Promise<CourseToProcess[]> {
 
 export async function main(): Promise<void> {
 	try {
-		console.log('Starting Domestika Downloader...');
+		logger.header('Domestika Downloader');
 
 		const auth = await domestikaAuth.getCookies();
 
@@ -126,10 +103,8 @@ export async function main(): Promise<void> {
 		const fromCsv = resolveCoursesFromCsv();
 		if (fromCsv.length > 0) {
 			coursesToProcess = fromCsv;
-		} else if (process.argv.length > 2) {
-			coursesToProcess = resolveCoursesFromArgs();
 		} else {
-			coursesToProcess = await resolveCoursesInteractively();
+			coursesToProcess = resolveCoursesFromArgs();
 		}
 
 		const n3u8dlPath = getN3u8DLPath();
@@ -140,7 +115,7 @@ export async function main(): Promise<void> {
 		}
 
 		if (coursesToProcess.length === 0) {
-			console.log('No courses to process.');
+			logger.warn('No courses to process.');
 			return;
 		}
 
@@ -148,15 +123,11 @@ export async function main(): Promise<void> {
 		const completedVideos = loadProgress();
 		logMemoryUsage(`After loadProgress (${completedVideos.size} videos in set)`);
 
-		console.log(`\n${coursesToProcess.length} course(s) will be processed:`);
-		for (const [i, course] of coursesToProcess.entries()) {
-			console.log(`${i + 1}. ${course.url} (${courseDisplayName(course)})`);
-		}
+		logger.header(`${coursesToProcess.length} course(s) to process`);
+		logger.list(coursesToProcess.map((c, i) => `${i + 1}. ${courseDisplayName(c)}`));
 
 		for (const [i, course] of coursesToProcess.entries()) {
-			console.log(
-				`\n📚 Processing course ${i + 1} of ${coursesToProcess.length}: ${courseDisplayName(course)}`
-			);
+			logger.header(`[${i + 1}/${coursesToProcess.length}] ${courseDisplayName(course)}`);
 			logMemoryUsage(`Before processing course ${i + 1}`);
 
 			try {
@@ -172,26 +143,26 @@ export async function main(): Promise<void> {
 				);
 
 				logMemoryUsage(`After processing course ${i + 1}`);
-				console.log(`✅ Course processing completed: ${courseDisplayName(course)}`);
+				logger.success(`Course done: ${courseDisplayName(course)}`);
 			} catch (error) {
 				const err = error as Error;
 				saveProgress(course.url, course.courseTitle, 'failed');
-				console.error(`❌ Course failed: ${courseDisplayName(course)} - ${err.message}`);
+				logger.error(`Course failed: ${courseDisplayName(course)} — ${err.message}`);
 				logMemoryUsage(`After failed course ${i + 1}`);
 			}
 		}
 
-		console.log('\n✅ All courses have been processed');
+		logger.success('All courses have been processed');
 	} catch (error) {
 		const err = error as Error;
-		console.error('Error:', err.message);
+		logger.error(err.message);
 		process.exit(1);
 	}
 }
 
 if (require.main === module) {
 	main().catch((error: Error) => {
-		console.error('Fatal error:', error);
+		logger.error(`Fatal error: ${error}`);
 		process.exit(1);
 	});
 }
