@@ -1,6 +1,7 @@
-import * as cheerio from 'cheerio';
 import type { Page } from 'puppeteer';
 import type { VideoData } from '../types';
+import { debugLog } from '../utils/debug';
+import { sanitizeTitle } from '../utils/strings';
 
 interface InitialPropsVideo {
 	video: {
@@ -11,42 +12,43 @@ interface InitialPropsVideo {
 
 interface InitialProps {
 	videos?: InitialPropsVideo[];
+	sectionTitle?: string;
 }
 
-export async function getInitialProps(url: string, page: Page): Promise<VideoData[]> {
+function mapVideos(videos: InitialPropsVideo[], section: string): VideoData[] {
+	return videos.flatMap((el) => {
+		if (!el?.video?.playbackURL || !el?.video?.title) return [];
+		debugLog(`Video found: ${el.video.title}`);
+		return [
+			{
+				playbackURL: el.video.playbackURL,
+				title: sanitizeTitle(el.video.title),
+				section,
+			},
+		];
+	});
+}
+
+export async function fetchUnitVideoData(url: string, page: Page): Promise<VideoData[]> {
 	await page.goto(url);
-	const data = (await page.evaluate(() => {
-		// Access __INITIAL_PROPS__ from the page's global scope
+
+	const initialProps = (await page.evaluate(() => {
 		const globalScope = globalThis as Record<string, unknown>;
-		const props =
+		return (
 			globalScope.__INITIAL_PROPS__ ||
-			(globalScope.window as { __INITIAL_PROPS__?: unknown } | undefined)?.__INITIAL_PROPS__;
-		return props;
+			(globalScope.window as { __INITIAL_PROPS__?: unknown } | undefined)?.__INITIAL_PROPS__
+		);
 	})) as InitialProps | null | undefined;
 
-	const html = await page.content();
-	const $ = cheerio.load(html);
+	const rawSection = await page
+		.$eval('h2.h3.course-header-new__subtitle', (el) => el.textContent?.trim() ?? '')
+		.catch(() => '');
+	const sanitizedSection = sanitizeTitle(rawSection);
 
-	const section = $('h2.h3.course-header-new__subtitle')
-		.text()
-		.trim()
-		.replace(/[/\\?%*:|"<>]/g, '-');
-
-	const videoData: VideoData[] = [];
-
-	if (data?.videos && data.videos.length > 0) {
-		for (let i = 0; i < data.videos.length; i++) {
-			const el = data.videos[i];
-			if (el?.video?.playbackURL && el?.video?.title) {
-				videoData.push({
-					playbackURL: el.video.playbackURL,
-					title: el.video.title.replace(/\./g, '').trim(),
-					section: section,
-				});
-				console.log(`Video found: ${el.video.title}`);
-			}
-		}
+	if (!initialProps?.videos?.length) {
+		debugLog(`[VIDEO-DATA] No videos found at ${url}`);
+		return [];
 	}
 
-	return videoData;
+	return mapVideos(initialProps.videos, sanitizedSection);
 }

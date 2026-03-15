@@ -68,3 +68,14 @@ export function debugLog(...args: unknown[]): void {
 export function isDebug(): boolean {
 	return isDebugMode;
 }
+
+/**
+ * Logs current process memory usage as a debug message.
+ */
+export function logMemoryUsage(label: string): void {
+	const usage = process.memoryUsage();
+	const formatMB = (bytes: number): string => (bytes / 1024 / 1024).toFixed(2);
+	debugLog(
+		`[MEMORY] ${label}: RSS=${formatMB(usage.rss)}MB, HeapUsed=${formatMB(usage.heapUsed)}MB, HeapTotal=${formatMB(usage.heapTotal)}MB, External=${formatMB(usage.external)}MB`
+	);
+}

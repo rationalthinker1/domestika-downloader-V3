@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { parse as csvParseSync } from 'csv-parse/sync';
 import { stringify as csvStringifySync } from 'csv-stringify/sync';
 import { debugLog } from '../utils/debug';
+import { VIDEO_EXTENSIONS } from '../utils/fs';
 import { getDownloadPath } from '../utils/paths';
 import { normalizeDomestikaUrl } from '../utils/url';
 
@@ -89,9 +90,6 @@ export async function checkVideoFileExists(
 
 	const fileNameBase = `${courseTitle} - U${unitNumber} - ${videoIndex}_${videoTitle.trimEnd()}`;
 
-	// Check for various possible file extensions
-	const possibleExtensions = ['.mp4', '.m3u8', '.ts', '.mkv', '.avi'];
-
 	// Check files in the directory
 	try {
 		const files = fs.readdirSync(finalDir);
@@ -100,7 +98,7 @@ export async function checkVideoFileExists(
 			if (file.startsWith(fileNameBase)) {
 				// Check if it's a video file (has video extension or is a common video format)
 				const ext = path.extname(file).toLowerCase();
-				if (possibleExtensions.includes(ext) || ext === '') {
+				if (VIDEO_EXTENSIONS.includes(ext) || ext === '') {
 					const fullPath = path.join(finalDir, file);
 					// Verify it's actually a file and not a directory
 					const stats = fs.statSync(fullPath);
@@ -164,17 +162,13 @@ export async function isVideoCompleted(
 // Cache to track written video IDs to avoid duplicate writes in this session
 const writtenVideoIds = new Set<string>();
 
-// Check if CSV file has header
+const CSV_HEADER = 'url,courseTitle,unitNumber,unitTitle,videoIndex,videoTitle,status,timestamp';
+
+// Check if CSV file has header (caller must ensure file exists)
 function hasCsvHeader(filePath: string): boolean {
-	if (!fs.existsSync(filePath)) {
-		return false;
-	}
 	try {
 		const content = fs.readFileSync(filePath, 'utf-8');
-		const firstLine = content.split('\n')[0]?.trim();
-		return (
-			firstLine === 'url,courseTitle,unitNumber,unitTitle,videoIndex,videoTitle,status,timestamp'
-		);
+		return content.split('\n')[0]?.trim() === CSV_HEADER;
 	} catch {
 		return false;
 	}
@@ -214,17 +208,13 @@ export function saveVideoProgress(
 		// Check if file exists and has header
 		const fileExists = fs.existsSync(progressFile);
 
-		if (!fileExists || !hasCsvHeader(progressFile)) {
-			// Write header if file doesn't exist or doesn't have proper header
-			const header =
-				'url,courseTitle,unitNumber,unitTitle,videoIndex,videoTitle,status,timestamp\n';
-			if (!fileExists) {
-				fs.writeFileSync(progressFile, header, 'utf-8');
-			} else {
-				// File exists but no header - prepend header (read existing, prepend header, write back)
-				const existingContent = fs.readFileSync(progressFile, 'utf-8');
-				fs.writeFileSync(progressFile, header + existingContent, 'utf-8');
-			}
+		const header = `${CSV_HEADER}\n`;
+		if (!fileExists) {
+			fs.writeFileSync(progressFile, header, 'utf-8');
+		} else if (!hasCsvHeader(progressFile)) {
+			// File exists but no header — prepend header
+			const existingContent = fs.readFileSync(progressFile, 'utf-8');
+			fs.writeFileSync(progressFile, header + existingContent, 'utf-8');
 		}
 
 		// Append the entry as a CSV row (simple append, no full file read)

@@ -1,38 +1,9 @@
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type * as cliProgress from 'cli-progress';
 import { getLanguageCode } from '../subtitles/language';
 import { debugLog, log, logError } from '../utils/debug';
-
-function spawnPromise(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-	return new Promise((resolve, reject) => {
-		const childProcess = spawn(command, args, { shell: false });
-
-		let stdout = '';
-		let stderr = '';
-
-		childProcess.stdout.on('data', (data: Buffer) => {
-			stdout += data.toString();
-		});
-
-		childProcess.stderr.on('data', (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		childProcess.on('close', (code: number | null) => {
-			if (code === 0) {
-				resolve({ stdout, stderr });
-			} else {
-				reject(new Error(`Process exited with code ${code}. ${stderr || stdout}`));
-			}
-		});
-
-		childProcess.on('error', (error: Error) => {
-			reject(error);
-		});
-	});
-}
+import { spawnPromise } from '../utils/process';
 
 /**
  * Embeds downloaded audio tracks into the video file.
@@ -129,9 +100,11 @@ export async function embedAudioTracks(
 		log(`Embedded ${validAudioPaths.length} audio track(s)${videoName}`, multiBar);
 
 		for (const audio of validAudioPaths) {
-			if (fs.existsSync(audio.path)) {
+			try {
 				fs.unlinkSync(audio.path);
 				debugLog(`Deleted audio file: ${audio.path}`);
+			} catch {
+				// already gone — ignore
 			}
 		}
 

@@ -1,21 +1,120 @@
 import * as cheerio from 'cheerio';
 import * as cliProgress from 'cli-progress';
 import inquirer from 'inquirer';
-import puppeteer, { type HTTPRequest } from 'puppeteer';
+import puppeteer, { type HTTPRequest, type Page } from 'puppeteer';
 import type { Credentials } from '../auth';
 import domestikaAuth from '../auth';
 import { isVideoCompleted } from '../csv/progress';
 import { downloadVideo } from '../downloader/downloader';
-import type { Unit, VideoSelection } from '../types';
-import { debugLog, logError, setActiveMultiBar } from '../utils/debug';
+import type { DownloadOption, Unit, VideoData, VideoSelection } from '../types';
+import { debugLog, logError, logMemoryUsage, setActiveMultiBar } from '../utils/debug';
+import { getEnvInt } from '../utils/env';
+import { sanitizeTitle } from '../utils/strings';
 import { loadCourseMetadata, saveCourseMetadata } from './cache';
-import { getInitialProps } from './video-data';
+import { fetchUnitVideoData } from './video-data';
+
+interface DownloadTask {
+	video: VideoData;
+	unit: Unit;
+	videoIndex: number;
+}
+
+function getMultiSectionUnits($: cheerio.CheerioAPI) {
+	return $('h4.h2.unit-item__title a');
+}
+
+function getSingleSectionUnits($: cheerio.CheerioAPI) {
+	return $('h5.h3.unit-subitem__title a');
+}
+
+async function getVideoFilesFromMultiSection(
+	units: ReturnType<typeof getMultiSectionUnits>,
+	$: cheerio.CheerioAPI,
+	page: Page
+): Promise<Unit[]> {
+	const videos: Unit[] = [];
+	for (let i = 0; i < units.length; i++) {
+		const unitHref = $(units[i]).attr('href');
+		if (!unitHref) {
+			throw new Error('Cannot download suitable unit link.');
+		}
+
+		const videoData = await fetchUnitVideoData(unitHref, page);
+		videos.push({
+			title: sanitizeTitle($(units[i]).text()),
+			videoData,
+			unitNumber: i + 1,
+		});
+	}
+	return videos;
+}
+
+async function getVideoFilesFromSingleSection(
+	units: ReturnType<typeof getSingleSectionUnits>,
+	$: cheerio.CheerioAPI,
+	page: Page
+): Promise<Unit[]> {
+	const unitHref = $(units[0]).attr('href');
+	if (!unitHref) {
+		throw new Error('Cannot download suitable unit link.');
+	}
+
+	const videoData = await fetchUnitVideoData(unitHref, page);
+	return videoData.map((video, index) => ({
+		title: video.title,
+		videoData: [video],
+		unitNumber: index + 1,
+	}));
+}
+
+async function closeBrowser(
+	page: Page | null,
+	requestHandler: ((req: HTTPRequest) => void) | null,
+	browser: Awaited<ReturnType<typeof puppeteer.launch>> | null
+): Promise<void> {
+	if (page && requestHandler) {
+		page.off('request', requestHandler);
+		await page.setRequestInterception(false);
+	}
+	if (page) await page.close();
+	if (browser) await browser.close();
+}
+
+async function promptCookieRefreshAndRetry(
+	courseUrl: string,
+	subtitleLangs: string[] | null,
+	downloadOption: DownloadOption,
+	courseTitle: string | null,
+	completedVideos: Set<string>
+): Promise<void> {
+	const answer = await inquirer.prompt<{ updateCookies: boolean }>([
+		{
+			type: 'confirm',
+			name: 'updateCookies',
+			message: 'Do you want to update the cookies?',
+			default: true,
+		},
+	]);
+
+	if (answer.updateCookies) {
+		await domestikaAuth.promptForCredentials(true);
+		return scrapeSite(
+			courseUrl,
+			subtitleLangs,
+			await domestikaAuth.getCookies(),
+			downloadOption,
+			courseTitle,
+			completedVideos
+		);
+	}
+}
+
 
 export async function scrapeSite(
 	courseUrl: string,
-	subtitle_langs: string[] | null,
+	subtitleLangs: string[] | null,
 	auth: Credentials,
-	downloadOption: string,
+	downloadOption: DownloadOption,
 	courseTitle: string | null,
 	completedVideos: Set<string> = new Set<string>()
 ): Promise<void> {
@@ -23,8 +122,7 @@ export async function scrapeSite(
 	const cachedMetadata = loadCourseMetadata(courseUrl);
 	let allVideos: Unit[] = [];
 	let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
-	let page: Awaited<ReturnType<Awaited<ReturnType<typeof puppeteer.launch>>['newPage']>> | null =
-		null;
+	let page: Page | null = null;
 	let requestHandler: ((req: HTTPRequest) => void) | null = null;
 
 	if (cachedMetadata) {
@@ -34,13 +132,11 @@ export async function scrapeSite(
 		console.log(`${allVideos.length} Units loaded from cache`);
 	} else {
 		debugLog(`[CACHE] Cache miss or expired for course: ${courseUrl}`);
-		// Configure Puppeteer
-		const puppeteerOptions: Parameters<typeof puppeteer.launch>[0] = {
+
+		browser = await puppeteer.launch({
 			headless: true,
 			args: ['--no-sandbox', '--disable-setuid-sandbox'],
-		};
-
-		browser = await puppeteer.launch(puppeteerOptions);
+		});
 		const context = browser.defaultBrowserContext();
 		await context.setCookie(...auth.cookies);
 		page = await browser.newPage();
@@ -66,96 +162,51 @@ export async function scrapeSite(
 
 		console.log('Analyzing site');
 
-		const units = $('h4.h2.unit-item__title a');
+		const multiUnits = getMultiSectionUnits($);
+		const singleUnits = getSingleSectionUnits($);
 
-		// Check if we're on the correct page
-		if (units.length === 0) {
-			// Remove request interception listener before closing
-			if (page && requestHandler) {
-				page.off('request', requestHandler);
-				await page.setRequestInterception(false);
-			}
-			if (page) await page.close();
-			if (browser) await browser.close();
-
+		if (multiUnits.length > 0) {
+			allVideos = await getVideoFilesFromMultiSection(multiUnits, $, page);
+		} else if (singleUnits.length > 0) {
+			allVideos = await getVideoFilesFromSingleSection(singleUnits, $, page);
+		} else {
+			await closeBrowser(page, requestHandler, browser);
 			console.log('\n❌ No videos found. This may be due to invalid cookies.');
-
-			const answer = await inquirer.prompt<{ updateCookies: boolean }>([
-				{
-					type: 'confirm',
-					name: 'updateCookies',
-					message: 'Do you want to update the cookies?',
-					default: true,
-				},
-			]);
-
-			if (answer.updateCookies) {
-				// Force credential update
-				await domestikaAuth.promptForCredentials(true);
-				// Try again with new credentials
-				return scrapeSite(
-					courseUrl,
-					subtitle_langs,
-					await domestikaAuth.getCookies(),
-					downloadOption,
-					courseTitle,
-					completedVideos
-				);
-			}
+			await promptCookieRefreshAndRetry(
+				courseUrl,
+				subtitleLangs,
+				downloadOption,
+				courseTitle,
+				completedVideos
+			);
 			throw new Error('Cannot download videos without valid cookies.');
 		}
 
 		console.log(`Course: ${courseTitle}`);
-		console.log(`${units.length} Units detected`);
+		console.log(`${allVideos.length} Units detected`);
 
-		for (let i = 0; i < units.length; i++) {
-			const unitHref = $(units[i]).attr('href');
-			if (!unitHref) continue;
-
-			const videoData = await getInitialProps(unitHref, page);
-			allVideos.push({
-				title: $(units[i])
-					.text()
-					.replace(/\./g, '')
-					.trim()
-					.replace(/[/\\?%*:|"<>]/g, '-'),
-				videoData: videoData,
-				unitNumber: i + 1,
-			});
-		}
-
-		// Save to cache after successful scraping
 		saveCourseMetadata(courseUrl, allVideos, courseTitle);
 		debugLog(`[CACHE] Saved metadata to cache for course: ${courseUrl}`);
 
-		// Remove request interception listener before closing
-		if (page && requestHandler) {
-			page.off('request', requestHandler);
-			await page.setRequestInterception(false);
-		}
-		if (page) await page.close();
-		if (browser) await browser.close();
+		await closeBrowser(page, requestHandler, browser);
 	}
 
-	// If user chose to download specific videos
 	if (downloadOption === 'specific') {
 		const videoChoices = allVideos.flatMap((unit) => {
-			// Create separator/header for the unit
 			const unitHeader = {
 				name: `Unit ${unit.unitNumber}: ${unit.title}`,
 				value: `unit_${unit.unitNumber}`,
 				checked: false,
 			};
 
-			// Create options for each video with indentation
-			const unitVideos = unit.videoData.map((vData, index) => ({
-				name: `    ${index + 1}. ${vData.title}`,
+			const unitVideos = unit.videoData.map((video, index) => ({
+				name: `    ${index + 1}. ${video.title}`,
 				value: {
 					unit: unit,
-					videoData: vData,
+					videoData: video,
 					index: index + 1,
 				},
-				short: vData.title,
+				short: video.title,
 			}));
 
 			return [unitHeader, ...unitVideos];
@@ -174,18 +225,15 @@ export async function scrapeSite(
 			]
 		);
 
-		// Process selections
 		for (const selection of selectedVideos.videosToDownload) {
 			if (typeof selection === 'string' && selection.startsWith('unit_')) {
-				// If a complete unit was selected
 				const unitNumber = Number.parseInt(selection.split('_')[1], 10);
 				const unit = allVideos.find((u) => u.unitNumber === unitNumber);
 
 				if (unit) {
 					for (let i = 0; i < unit.videoData.length; i++) {
 						const videoIndex = i + 1;
-						const vData = unit.videoData[i];
-						// Check if video is already completed (including file system check)
+						const video = unit.videoData[i];
 						if (
 							await isVideoCompleted(
 								courseUrl,
@@ -194,19 +242,19 @@ export async function scrapeSite(
 								completedVideos,
 								courseTitle,
 								unit.title,
-								vData.title,
-								vData.section
+								video.title,
+								video.section
 							)
 						) {
-							console.log(`⏭️  Skipping already downloaded: ${vData.title}`);
+							console.log(`⏭️  Skipping already downloaded: ${video.title}`);
 							continue;
 						}
 						await downloadVideo(
-							vData,
+							video,
 							courseTitle,
 							unit.title,
 							videoIndex,
-							subtitle_langs,
+							subtitleLangs,
 							unit.unitNumber,
 							undefined,
 							courseUrl,
@@ -215,8 +263,6 @@ export async function scrapeSite(
 					}
 				}
 			} else if (typeof selection === 'object' && 'videoData' in selection) {
-				// If a specific video was selected
-				// Check if video is already completed (including file system check)
 				if (
 					await isVideoCompleted(
 						courseUrl,
@@ -236,7 +282,7 @@ export async function scrapeSite(
 						courseTitle,
 						selection.unit.title,
 						selection.index,
-						subtitle_langs,
+						subtitleLangs,
 						selection.unit.unitNumber,
 						undefined,
 						courseUrl,
@@ -245,48 +291,14 @@ export async function scrapeSite(
 				}
 			}
 		}
-
-		// Clean up browser if it was opened
-		if (page && requestHandler) {
-			page.off('request', requestHandler);
-			await page.setRequestInterception(false);
-		}
-		if (page) await page.close();
-		if (browser) await browser.close();
 		return;
 	}
 
 	// If we reach here it's because downloadOption === 'all'
 	console.log('Downloading entire course...');
 	let downloadedCount = 0;
-
-	// Count how many videos are already completed
 	let skippedCount = 0;
-	for (const unit of allVideos) {
-		for (let i = 0; i < unit.videoData.length; i++) {
-			const vData = unit.videoData[i];
-			if (
-				await isVideoCompleted(
-					courseUrl,
-					unit.unitNumber,
-					i + 1,
-					completedVideos,
-					courseTitle,
-					unit.title,
-					vData.title,
-					vData.section
-				)
-			) {
-				skippedCount++;
-			}
-		}
-	}
 
-	if (skippedCount > 0) {
-		console.log(`⏭️  Skipping ${skippedCount} already downloaded video(s)`);
-	}
-
-	// Create a MultiBar for parallel downloads to avoid progress bar conflicts
 	const multiBar = new cliProgress.MultiBar({
 		format: '  {title} |{bar}| {percentage}% | ETA: {eta}s',
 		barCompleteChar: '\u2588',
@@ -301,29 +313,20 @@ export async function scrapeSite(
 		notTTYSchedule: 2000,
 	});
 
-	// Set as active multiBar for safe logging
 	setActiveMultiBar(multiBar);
 
-	// Build queue of download tasks (don't start them yet)
-	interface DownloadTask {
-		vData: (typeof allVideos)[0]['videoData'][0];
-		unit: (typeof allVideos)[0];
-		videoIndex: number;
-	}
-
+	// Build queue, counting skips in a single pass
 	const downloadQueue: DownloadTask[] = [];
 
-	for (let i = 0; i < allVideos.length; i++) {
-		const unit = allVideos[i];
-		for (let a = 0; a < unit.videoData.length; a++) {
-			const vData = unit.videoData[a];
-			if (!vData || !vData.playbackURL) {
-				logError(`Error: Invalid video data for ${unit.title} #${a}`, multiBar);
+	for (const unit of allVideos) {
+		for (let i = 0; i < unit.videoData.length; i++) {
+			const video = unit.videoData[i];
+			if (!video?.playbackURL) {
+				logError(`Error: Invalid video data for ${unit.title} #${i}`, multiBar);
 				continue;
 			}
 
-			const videoIndex = a + 1;
-			// Check if video is already completed (including file system check)
+			const videoIndex = i + 1;
 			if (
 				await isVideoCompleted(
 					courseUrl,
@@ -332,64 +335,45 @@ export async function scrapeSite(
 					completedVideos,
 					courseTitle,
 					unit.title,
-					vData.title,
-					vData.section
+					video.title,
+					video.section
 				)
 			) {
-				// Don't log skipped videos here - will be noisy with progress bars
-				// The summary at the end will show how many were skipped
+				skippedCount++;
 				continue;
 			}
 
-			downloadQueue.push({ vData, unit, videoIndex });
+			downloadQueue.push({ video, unit, videoIndex });
 		}
 	}
 
-	// Process downloads with configurable concurrency (default: 2)
-	const maxConcurrentEnv = process.env.MAX_CONCURRENT_DOWNLOADS
-		? Number.parseInt(process.env.MAX_CONCURRENT_DOWNLOADS, 10)
-		: 2;
-	const MAX_CONCURRENT_DOWNLOADS =
-		Number.isNaN(maxConcurrentEnv) || maxConcurrentEnv < 1 ? 2 : maxConcurrentEnv;
+	if (skippedCount > 0) {
+		console.log(`⏭️  Skipping ${skippedCount} already downloaded video(s)`);
+	}
 
-	// Log memory usage
-	const logMemoryUsage = (label: string): void => {
-		const usage = process.memoryUsage();
-		const formatMB = (bytes: number): string => (bytes / 1024 / 1024).toFixed(2);
-		debugLog(
-			`[MEMORY] ${label}: RSS=${formatMB(usage.rss)}MB, HeapUsed=${formatMB(usage.heapUsed)}MB, HeapTotal=${formatMB(usage.heapTotal)}MB, External=${formatMB(usage.external)}MB`
-		);
-	};
+	const MAX_CONCURRENT_DOWNLOADS = getEnvInt('MAX_CONCURRENT_DOWNLOADS', 2);
 
 	debugLog(
 		`[DOWNLOAD] Starting download queue with ${downloadQueue.length} videos, max concurrency: ${MAX_CONCURRENT_DOWNLOADS}`
 	);
 	logMemoryUsage('Before starting downloads');
 
-	// Process queue with concurrency limit using a more memory-efficient approach
 	let processedCount = 0;
-
-	// Use a Set to track active promises for better memory management
-	const activePromises = new Set<Promise<void>>();
+	const activeDownloads: Promise<void>[] = [];
 
 	for (const task of downloadQueue) {
-		// Wait until we have a free slot
-		while (activePromises.size >= MAX_CONCURRENT_DOWNLOADS) {
-			// Block until ANY download finishes using Promise.race()
-			// When it resolves, the completed download will have already removed itself
-			// from activePromises via its finally() handler, freeing up a slot
-			await Promise.race(Array.from(activePromises));
+		while (activeDownloads.length >= MAX_CONCURRENT_DOWNLOADS) {
+			await Promise.race(activeDownloads);
 		}
 
-		// Create and start the download promise
 		const downloadPromise = (async (): Promise<void> => {
 			try {
 				await downloadVideo(
-					task.vData,
+					task.video,
 					courseTitle,
 					task.unit.title,
 					task.videoIndex,
-					subtitle_langs,
+					subtitleLangs,
 					task.unit.unitNumber,
 					multiBar,
 					courseUrl,
@@ -398,7 +382,6 @@ export async function scrapeSite(
 				downloadedCount++;
 				processedCount++;
 
-				// Log memory every 10 videos
 				if (processedCount % 10 === 0) {
 					logMemoryUsage(`After ${processedCount} videos processed`);
 					debugLog(
@@ -407,65 +390,36 @@ export async function scrapeSite(
 				}
 			} catch (error) {
 				const err = error as Error;
-				logError(`❌ Error in video ${task.vData.title}: ${err.message}`, multiBar);
+				logError(`❌ Error in video ${task.video.title}: ${err.message}`, multiBar);
 				processedCount++;
 			}
 		})();
 
-		// Add to active set and ensure cleanup when done
-		activePromises.add(downloadPromise);
+		activeDownloads.push(downloadPromise);
 		downloadPromise.finally(() => {
-			// Ensure we remove from active set when done
-			activePromises.delete(downloadPromise);
+			const idx = activeDownloads.indexOf(downloadPromise);
+			if (idx !== -1) activeDownloads.splice(idx, 1);
 		});
 	}
 
-	// Wait for all remaining downloads to complete
-	await Promise.all(Array.from(activePromises));
+	await Promise.all(activeDownloads);
 
-	// Stop the MultiBar after all downloads complete
 	multiBar.stop();
-	// Clear active multiBar reference
 	setActiveMultiBar(null);
 	logMemoryUsage('After all downloads completed');
 
-	// Print summary
 	console.log(
 		`\n✅ Download summary: ${downloadedCount} new video(s) downloaded, ${skippedCount} already downloaded`
 	);
 
 	if (downloadedCount === 0 && skippedCount === 0) {
 		console.log('\n❌ Could not download any videos. This may be due to invalid cookies.');
-
-		const answer = await inquirer.prompt<{ updateCookies: boolean }>([
-			{
-				type: 'confirm',
-				name: 'updateCookies',
-				message: 'Do you want to update the cookies?',
-				default: true,
-			},
-		]);
-
-		if (answer.updateCookies) {
-			// Force credential update
-			await domestikaAuth.promptForCredentials(true);
-			// Try again with new credentials
-			return scrapeSite(
-				courseUrl,
-				subtitle_langs,
-				await domestikaAuth.getCookies(),
-				downloadOption,
-				courseTitle,
-				completedVideos
-			);
-		}
+		await promptCookieRefreshAndRetry(
+			courseUrl,
+			subtitleLangs,
+			downloadOption,
+			courseTitle,
+			completedVideos
+		);
 	}
-
-	// Clean up browser if it was opened
-	if (page && requestHandler) {
-		page.off('request', requestHandler);
-		await page.setRequestInterception(false);
-	}
-	if (page) await page.close();
-	if (browser) await browser.close();
 }

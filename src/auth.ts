@@ -1,7 +1,7 @@
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import inquirer from 'inquirer';
 import 'dotenv/config';
+import { updateEnvFile } from './utils/env';
 
 export interface Cookie {
 	name: string;
@@ -11,22 +11,22 @@ export interface Cookie {
 
 export interface Credentials {
 	cookies: Cookie[];
-	_credentials_: string;
+	credentialsToken: string;
 	getAccessToken: () => string;
 }
 
+const ACCESS_TOKEN_REGEX = /accessToken":"(.*?)"/;
+const ENV_FILE_PATH = path.join(process.cwd(), '.env');
+
 export class DomestikaAuth {
-	private envPath: string;
 	public cookies: Cookie[] = [];
-	public _credentials_ = '';
+	public credentialsToken = '';
 
 	constructor() {
-		// Use current working directory for .env file
-		this.envPath = path.join(process.cwd(), '.env');
-		this.loadCredentials();
+		this.readEnvCredentials();
 	}
 
-	loadCredentials(): void {
+	readEnvCredentials(): void {
 		this.cookies = [
 			{
 				name: '_domestika_session',
@@ -34,7 +34,16 @@ export class DomestikaAuth {
 				domain: 'www.domestika.org',
 			},
 		];
-		this._credentials_ = process.env.DOMESTIKA_CREDENTIALS || '';
+		this.credentialsToken = process.env.DOMESTIKA_CREDENTIALS || '';
+	}
+
+	private extractAccessToken(): string | null {
+		try {
+			const match = ACCESS_TOKEN_REGEX.exec(decodeURI(this.credentialsToken));
+			return match?.[1] ?? null;
+		} catch {
+			return null;
+		}
 	}
 
 	async promptForCredentials(forceUpdate = false): Promise<void> {
@@ -47,130 +56,52 @@ export class DomestikaAuth {
 		console.log('   - _credentials\n');
 
 		const answers = await inquirer.prompt<{
-			domestika_session?: string;
-			credentials?: string;
+			sessionCookie?: string;
+			credentialsCookie?: string;
 		}>([
 			{
 				type: 'input',
-				name: 'domestika_session',
+				name: 'sessionCookie',
 				message: 'Enter the value of the _domestika_session cookie:',
 				when: () => forceUpdate || !this.cookies[0].value,
 			},
 			{
 				type: 'input',
-				name: 'credentials',
+				name: 'credentialsCookie',
 				message: 'Enter the value of the _credentials cookie:',
-				when: () => forceUpdate || !this._credentials_,
+				when: () => forceUpdate || !this.credentialsToken,
 			},
 		]);
 
-		if (answers.domestika_session) {
-			this.cookies[0].value = answers.domestika_session;
+		if (answers.sessionCookie) {
+			this.cookies[0].value = answers.sessionCookie;
 		}
-		if (answers.credentials) {
-			this._credentials_ = answers.credentials;
+		if (answers.credentialsCookie) {
+			this.credentialsToken = answers.credentialsCookie;
 		}
 
-		// Save credentials to .env file
-		await this.saveCredentials();
+		this.saveCredentials();
 	}
 
-	async saveCredentials(): Promise<void> {
-		// Read existing .env file if it exists
-		let existingContent = '';
-		try {
-			if (fs.existsSync(this.envPath)) {
-				existingContent = fs.readFileSync(this.envPath, 'utf8');
-			}
-		} catch (_error) {
-			// If file doesn't exist or can't be read, start with empty content
-			existingContent = '';
-		}
+	saveCredentials(): void {
+		updateEnvFile(ENV_FILE_PATH, {
+			DOMESTIKA_SESSION: this.cookies[0].value,
+			DOMESTIKA_CREDENTIALS: this.credentialsToken,
+		});
 
-		// Parse existing content and preserve non-cookie variables
-		const lines = existingContent.split('\n');
-		const preservedLines: string[] = [];
-		let hasDomestikaSession = false;
-		let hasDomestikaCredentials = false;
-
-		for (const line of lines) {
-			const trimmedLine = line.trim();
-
-			// Preserve comments and empty lines
-			if (trimmedLine.startsWith('#') || trimmedLine === '') {
-				preservedLines.push(line);
-				continue;
-			}
-
-			// Check if this is a cookie variable
-			if (trimmedLine.startsWith('DOMESTIKA_SESSION=')) {
-				hasDomestikaSession = true;
-				// Skip this line, we'll add it with new value
-				continue;
-			}
-
-			if (trimmedLine.startsWith('DOMESTIKA_CREDENTIALS=')) {
-				hasDomestikaCredentials = true;
-				// Skip this line, we'll add it with new value
-				continue;
-			}
-
-			// Preserve all other variables
-			preservedLines.push(line);
-		}
-
-		// Build the new content
-		const newLines: string[] = [];
-
-		// Add preserved lines
-		newLines.push(...preservedLines);
-
-		// Add cookie variables (update if they existed, add if they didn't)
-		if (!hasDomestikaSession && preservedLines.length > 0) {
-			// Add a blank line before cookie variables if there are other variables
-			newLines.push('');
-		}
-
-		// Add comment if this is the first time adding credentials
-		if (!hasDomestikaSession && !hasDomestikaCredentials && preservedLines.length === 0) {
-			newLines.push('# Domestika Credentials');
-		}
-
-		newLines.push(`DOMESTIKA_SESSION=${this.cookies[0].value}`);
-		newLines.push(`DOMESTIKA_CREDENTIALS=${this._credentials_}`);
-
-		// Write merged content back to .env
-		const envContent = newLines.join('\n');
-		fs.writeFileSync(this.envPath, envContent, 'utf8');
-
-		// Update environment variables at runtime
 		process.env.DOMESTIKA_SESSION = this.cookies[0].value;
-		process.env.DOMESTIKA_CREDENTIALS = this._credentials_;
+		process.env.DOMESTIKA_CREDENTIALS = this.credentialsToken;
 	}
 
-	async validateCredentials(): Promise<boolean> {
-		try {
-			const regex_token = /accessToken":"(.*?)"/gm;
-			const match = regex_token.exec(decodeURI(this._credentials_));
-
-			if (!match || !this.cookies[0].value) {
-				throw new Error('Invalid credentials');
-			}
-
-			return true;
-		} catch (_error) {
-			console.log('\nError: The credentials appear to be invalid.');
-			return false;
-		}
+	validateCredentials(): boolean {
+		return !!this.extractAccessToken() && !!this.cookies[0].value;
 	}
 
 	async getCookies(): Promise<Credentials> {
-		// Validate and request credentials if necessary
-		if (!(await this.validateCredentials())) {
+		if (!this.validateCredentials()) {
 			await this.promptForCredentials();
 
-			// Validate again after obtaining credentials
-			if (!(await this.validateCredentials())) {
+			if (!this.validateCredentials()) {
 				throw new Error(
 					'Could not obtain valid credentials. Please verify your Domestika cookies.'
 				);
@@ -179,14 +110,11 @@ export class DomestikaAuth {
 
 		return {
 			cookies: this.cookies,
-			_credentials_: this._credentials_,
+			credentialsToken: this.credentialsToken,
 			getAccessToken: () => {
-				const regex_token = /accessToken":"(.*?)"/gm;
-				const match = regex_token.exec(decodeURI(this._credentials_));
-				if (!match) {
-					throw new Error('Could not extract access token from credentials');
-				}
-				return match[1];
+				const token = this.extractAccessToken();
+				if (!token) throw new Error('Could not extract access token from credentials');
+				return token;
 			},
 		};
 	}

@@ -1,127 +1,83 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Unit } from '../types';
+import { getEnvBool, getEnvInt } from '../utils/env';
 import { normalizeDomestikaUrl } from '../utils/url';
 
-interface CachedCourseMetadata {
+interface CachedCourse {
 	metadata: Unit[];
 	timestamp: number;
 	courseTitle: string | null;
 }
 
-interface CacheFile {
-	[normalizedCourseUrl: string]: CachedCourseMetadata;
+interface CacheStore {
+	[normalizedUrl: string]: CachedCourse;
 }
 
 const CACHE_FILE = path.join(process.cwd(), 'course-metadata-cache.json');
-const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
 
-/**
- * Get the cache TTL from environment variable or use default
- */
-function getCacheTTL(): number {
-	const ttlEnv = process.env.CACHE_TTL;
-	if (ttlEnv) {
-		const ttl = Number.parseInt(ttlEnv, 10);
-		if (!Number.isNaN(ttl) && ttl > 0) {
-			return ttl;
-		}
-	}
-	return DEFAULT_TTL_MS;
-}
+// Parse env config once at module init
+const CACHE_DISABLED = getEnvBool('NO_CACHE');
+const CACHE_TTL_MS = getEnvInt('CACHE_TTL', 7 * 24 * 60 * 60 * 1000, 1);
 
-/**
- * Check if caching is disabled via environment variable
- */
-function isCacheDisabled(): boolean {
-	return process.env.NO_CACHE === 'true' || process.env.NO_CACHE === '1';
-}
+// In-memory cache layer — avoids repeated full-file reads within a session
+let memoryCache: CacheStore | null = null;
 
-/**
- * Load the entire cache file
- */
-function loadCacheFile(): CacheFile {
+function loadStore(): CacheStore {
+	if (memoryCache !== null) return memoryCache;
+
 	if (!fs.existsSync(CACHE_FILE)) {
-		return {};
+		memoryCache = {};
+		return memoryCache;
 	}
 
 	try {
 		const content = fs.readFileSync(CACHE_FILE, 'utf-8');
-		return JSON.parse(content) as CacheFile;
-	} catch (error) {
-		const err = error as Error;
-		console.warn(`Warning: Could not read cache file: ${err.message}`);
-		return {};
+		memoryCache = JSON.parse(content) as CacheStore;
+		return memoryCache;
+	} catch (err) {
+		console.warn(`Warning: Could not read cache file: ${(err as Error).message}`);
+		memoryCache = {};
+		return memoryCache;
 	}
 }
 
-/**
- * Save the entire cache file
- */
-function saveCacheFile(cache: CacheFile): void {
+function persistStore(store: CacheStore): void {
 	try {
-		fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf-8');
-	} catch (error) {
-		const err = error as Error;
-		console.warn(`Warning: Could not write cache file: ${err.message}`);
+		fs.writeFileSync(CACHE_FILE, JSON.stringify(store, null, 2), 'utf-8');
+	} catch (err) {
+		console.warn(`Warning: Could not write cache file: ${(err as Error).message}`);
 	}
 }
 
-/**
- * Check if cached metadata is still valid based on TTL
- */
-function isCacheValid(cached: CachedCourseMetadata): boolean {
-	const ttl = getCacheTTL();
-	const age = Date.now() - cached.timestamp;
-	return age < ttl;
+function isExpired(entry: CachedCourse): boolean {
+	return Date.now() - entry.timestamp >= CACHE_TTL_MS;
 }
 
-/**
- * Load cached course metadata if available and valid
- */
 export function loadCourseMetadata(courseUrl: string): Unit[] | null {
-	if (isCacheDisabled()) {
-		return null;
-	}
+	if (CACHE_DISABLED) return null;
 
-	const normalized = normalizeDomestikaUrl(courseUrl);
-	const cache = loadCacheFile();
-	const cached = cache[normalized.url];
+	const { url } = normalizeDomestikaUrl(courseUrl);
+	const store = loadStore();
+	const entry = store[url];
 
-	if (!cached) {
-		return null;
-	}
+	if (!entry) return null;
+	// Lazy expiry — skip without rewriting the file
+	if (isExpired(entry)) return null;
 
-	if (!isCacheValid(cached)) {
-		// Cache expired, remove it
-		delete cache[normalized.url];
-		saveCacheFile(cache);
-		return null;
-	}
-
-	return cached.metadata;
+	return entry.metadata;
 }
 
-/**
- * Save course metadata to cache
- */
 export function saveCourseMetadata(
 	courseUrl: string,
 	metadata: Unit[],
 	courseTitle: string | null
 ): void {
-	if (isCacheDisabled()) {
-		return;
-	}
+	if (CACHE_DISABLED) return;
 
-	const normalized = normalizeDomestikaUrl(courseUrl);
-	const cache = loadCacheFile();
+	const { url } = normalizeDomestikaUrl(courseUrl);
+	const store = loadStore();
 
-	cache[normalized.url] = {
-		metadata,
-		timestamp: Date.now(),
-		courseTitle,
-	};
-
-	saveCacheFile(cache);
+	store[url] = { metadata, timestamp: Date.now(), courseTitle };
+	persistStore(store);
 }

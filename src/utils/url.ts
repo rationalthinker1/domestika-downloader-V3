@@ -1,23 +1,17 @@
 import type { NormalizedUrl } from '../types';
+import { toTitleCase } from './strings';
 
-// Function to normalize Domestika URLs
+export const DOMESTIKA_URL_PATTERN = /domestika\.org\/.*?\/courses\/(\d+)-([-\w]+)/;
+
 export function normalizeDomestikaUrl(url: string): NormalizedUrl {
-	const courseRegex = /domestika\.org\/.*?\/courses\/(\d+)-([-\w]+)/;
-	const match = url.match(courseRegex);
+	const match = url.match(DOMESTIKA_URL_PATTERN);
 
 	if (match) {
-		// Extract and clean the course title
-		const rawTitle = match[2]
-			.replace(/-/g, ' ') // Replace hyphens with spaces
-			.split(' ')
-			.map((word) => word.charAt(0).toUpperCase() + word.slice(1)) // Capitalize each word
-			.join(' ');
-
 		return {
 			url: `https://www.domestika.org/es/courses/${match[1]}/course`,
-			courseTitle: rawTitle,
+			courseTitle: toTitleCase(match[2]),
 		};
 	}
 
-	return { url: url, courseTitle: null };
+	return { url, courseTitle: null };
 }

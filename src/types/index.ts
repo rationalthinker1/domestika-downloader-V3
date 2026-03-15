@@ -3,17 +3,19 @@ export interface NormalizedUrl {
 	courseTitle: string | null;
 }
 
+export type DownloadOption = 'all' | 'specific';
+
 export interface CSVCourse {
 	url: string;
 	subtitles: string | null;
-	downloadOption: string;
+	downloadOption: DownloadOption;
 }
 
 export interface CourseToProcess {
 	url: string;
 	courseTitle: string | null;
 	subtitles: string[] | null;
-	downloadOption: string;
+	downloadOption: DownloadOption;
 }
 
 export interface VideoData {

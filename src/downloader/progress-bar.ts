@@ -1,159 +1,151 @@
 import { spawn } from 'node:child_process';
 import * as cliProgress from 'cli-progress';
+import { appendCapped, truncateWithEllipsis } from '../utils/strings';
 
-// Function to execute N_m3u8DL-RE with progress tracking
-export function executeWithProgress(
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const TITLE_DISPLAY_WIDTH = 30;
+const OUTPUT_BUFFER_LIMIT = 100 * 1024; // 100 KB
+
+// Compiled once at module level — not recreated on every line of output
+const PROGRESS_PATTERNS = [
+	/(\d+\.?\d*)%/g,                   // bare percentage: "50.0%"
+	/\[(\d+\.?\d*)%\]/g,               // bracketed: "[50%]"
+	/segment\s+(\d+)\/(\d+)/gi,        // segment count: "Segment 10/20"
+	/downloaded\s+(\d+\.?\d*)%/gi,     // "Downloaded 50%"
+] as const;
+
+const COMPLETION_MARKERS = ['Download completed', 'Merging', 'Done', 'Successfully'] as const;
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/** Extracts a 0–100 progress value from a single output line. Returns null if none found. */
+export function extractProgressFromLine(line: string): number | null {
+	for (const pattern of PROGRESS_PATTERNS) {
+		pattern.lastIndex = 0; // reset stateful global regex
+		const match = pattern.exec(line);
+		if (!match) continue;
+
+		const value =
+			match.length === 3
+				? (Number.parseInt(match[1], 10) / Number.parseInt(match[2], 10)) * 100
+				: Number.parseFloat(match[1]);
+
+		if (value > 0 && value <= 100) return value;
+	}
+	return null;
+}
+
+function formatDisplayTitle(title: string): string {
+	return truncateWithEllipsis(title, TITLE_DISPLAY_WIDTH).padEnd(TITLE_DISPLAY_WIDTH);
+}
+
+// ---------------------------------------------------------------------------
+// Progress bar management
+// ---------------------------------------------------------------------------
+
+type AnyBar = cliProgress.SingleBar | ReturnType<cliProgress.MultiBar['create']>;
+
+function createBar(title: string, multiBar?: cliProgress.MultiBar): AnyBar {
+	const displayTitle = formatDisplayTitle(title);
+	if (multiBar) {
+		return multiBar.create(100, 0, { title: displayTitle });
+	}
+	return new cliProgress.SingleBar({
+		format: `  ${displayTitle} |{bar}| {percentage}% | ETA: {eta}s`,
+		barCompleteChar: '\u2588',
+		barIncompleteChar: '\u2591',
+		hideCursor: true,
+		clearOnComplete: true,
+	});
+}
+
+function updateBar(bar: AnyBar, value: number, displayTitle: string, multiBar?: cliProgress.MultiBar): void {
+	if (multiBar) {
+		(bar as ReturnType<cliProgress.MultiBar['create']>).update(value, { title: displayTitle });
+	} else {
+		(bar as cliProgress.SingleBar).update(value);
+	}
+}
+
+function teardownBar(bar: AnyBar, multiBar?: cliProgress.MultiBar): void {
+	if (multiBar) {
+		multiBar.remove(bar as ReturnType<cliProgress.MultiBar['create']>);
+	} else {
+		(bar as cliProgress.SingleBar).stop();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Main export
+// ---------------------------------------------------------------------------
+
+export function spawnWithProgress(
 	command: string,
 	args: string[],
 	videoTitle: string,
 	multiBar?: cliProgress.MultiBar
 ): Promise<{ stdout: string; stderr: string }> {
 	return new Promise((resolve, reject) => {
-		// Truncate video title if too long for display
-		const displayTitle = videoTitle.length > 30 ? `${videoTitle.substring(0, 27)}...` : videoTitle;
+		const displayTitle = formatDisplayTitle(videoTitle);
+		const bar = createBar(videoTitle, multiBar);
 
-		// Use MultiBar if provided (for parallel downloads), otherwise use SingleBar
-		const progressBar = multiBar
-			? multiBar.create(100, 0, {
-					title: displayTitle.padEnd(30),
-				})
-			: new cliProgress.SingleBar({
-					format: `  ${displayTitle.padEnd(30)} |{bar}| {percentage}% | ETA: {eta}s`,
-					barCompleteChar: '\u2588',
-					barIncompleteChar: '\u2591',
-					hideCursor: true,
-					clearOnComplete: true,
-				});
+		const proc = spawn(command, args, { cwd: process.cwd(), shell: false });
 
-		const childProcess = spawn(command, args, {
-			cwd: process.cwd(),
-			shell: false,
-		});
-
-		// Limit buffer sizes to prevent memory leaks (max 100KB each - more aggressive)
-		const MAX_BUFFER_SIZE = 100 * 1024;
 		let stdout = '';
 		let stderr = '';
-		let progressStarted = false;
+		let lineBuffer = '';
+		let barStarted = false;
 		let lastProgress = 0;
-		let buffer = '';
 
-		const parseProgress = (output: string): boolean => {
-			// Multiple patterns to catch different output formats from N_m3u8DL-RE
-			// Pattern 1: "Progress: 50.0%" or "50.0%"
-			// Pattern 2: "Downloaded: 50%" or "[50%]"
-			// Pattern 3: "Segment 10/20" (calculate percentage)
-			const patterns = [
-				/(\d+\.?\d*)%/g, // Percentage pattern
-				/\[(\d+\.?\d*)%\]/g, // Bracketed percentage
-				/segment\s+(\d+)\/(\d+)/gi, // Segment progress
-				/downloaded\s+(\d+\.?\d*)%/gi, // Downloaded percentage
-			];
+		const handleProgressLine = (line: string): void => {
+			const progress = extractProgressFromLine(line);
 
-			for (const pattern of patterns) {
-				let match: RegExpExecArray | null = pattern.exec(output);
-				while (match !== null) {
-					let progress = 0;
-
-					if (match.length === 3) {
-						// Segment pattern: calculate percentage
-						const current = Number.parseInt(match[1], 10);
-						const total = Number.parseInt(match[2], 10);
-						if (total > 0) {
-							progress = (current / total) * 100;
-						}
-					} else {
-						progress = Number.parseFloat(match[1]);
-					}
-
-					if (progress > 0 && progress <= 100) {
-						if (!progressStarted) {
-							progressStarted = true;
-							if (!multiBar) {
-								progressBar.start(100, 0);
-							}
-						}
-						const roundedProgress = Math.min(100, Math.max(0, Math.round(progress)));
-						if (roundedProgress !== lastProgress) {
-							if (multiBar) {
-								progressBar.update(roundedProgress, { title: displayTitle.padEnd(30) });
-							} else {
-								progressBar.update(roundedProgress);
-							}
-							lastProgress = roundedProgress;
-						}
-						return true;
-					}
-					match = pattern.exec(output);
+			if (progress !== null) {
+				if (!barStarted) {
+					barStarted = true;
+					if (!multiBar) (bar as cliProgress.SingleBar).start(100, 0);
 				}
+				const rounded = Math.min(100, Math.max(0, Math.round(progress)));
+				if (rounded !== lastProgress) {
+					updateBar(bar, rounded, displayTitle, multiBar);
+					lastProgress = rounded;
+				}
+				return;
 			}
-			return false;
-		};
 
-		const processOutput = (data: Buffer): void => {
-			const output = data.toString();
-			buffer += output;
-
-			// Process line by line for better parsing
-			const lines = buffer.split('\n');
-			buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-			for (const line of lines) {
-				parseProgress(line);
-
-				// Look for completion indicators
-				if (
-					line.includes('Download completed') ||
-					line.includes('Merging') ||
-					line.includes('Done') ||
-					line.includes('Successfully')
-				) {
-					if (progressStarted) {
-						if (multiBar) {
-							progressBar.update(100, { title: displayTitle.padEnd(30) });
-						} else {
-							progressBar.update(100);
-						}
-					}
-				}
+			if (barStarted && COMPLETION_MARKERS.some((m) => line.includes(m))) {
+				updateBar(bar, 100, displayTitle, multiBar);
 			}
 		};
 
-		childProcess.stdout.on('data', (data: Buffer) => {
-			const dataStr = data.toString();
-			// Limit stdout buffer size to prevent memory leaks - keep only last portion
-			stdout += dataStr;
-			if (stdout.length > MAX_BUFFER_SIZE) {
-				stdout = stdout.slice(-MAX_BUFFER_SIZE);
-			}
-			processOutput(data);
+		const handleOutputChunk = (data: Buffer): void => {
+			lineBuffer += data.toString();
+			const lines = lineBuffer.split('\n');
+			lineBuffer = lines.pop() ?? '';
+			for (const line of lines) handleProgressLine(line);
+		};
+
+		proc.stdout.on('data', (data: Buffer) => {
+			stdout = appendCapped(stdout, data.toString(), OUTPUT_BUFFER_LIMIT);
+			handleOutputChunk(data);
 		});
 
-		childProcess.stderr.on('data', (data: Buffer) => {
-			const dataStr = data.toString();
-			// Limit stderr buffer size to prevent memory leaks - keep only last portion
-			stderr += dataStr;
-			if (stderr.length > MAX_BUFFER_SIZE) {
-				stderr = stderr.slice(-MAX_BUFFER_SIZE);
-			}
-			processOutput(data);
+		proc.stderr.on('data', (data: Buffer) => {
+			stderr = appendCapped(stderr, data.toString(), OUTPUT_BUFFER_LIMIT);
+			handleOutputChunk(data);
 		});
 
-		childProcess.on('close', (code: number | null) => {
-			// Process remaining buffer
-			if (buffer) {
-				parseProgress(buffer);
-			}
+		proc.on('close', (code: number | null) => {
+			if (lineBuffer) handleProgressLine(lineBuffer);
 
-			if (progressStarted) {
-				if (multiBar) {
-					progressBar.update(100, { title: displayTitle.padEnd(30) });
-					// Remove the bar from MultiBar to free memory and clear display
-					multiBar.remove(progressBar);
-				} else {
-					progressBar.update(100);
-					progressBar.stop();
-				}
+			if (barStarted) {
+				updateBar(bar, 100, displayTitle, multiBar);
+				teardownBar(bar, multiBar);
 			}
 
 			if (code === 0) {
@@ -163,14 +155,8 @@ export function executeWithProgress(
 			}
 		});
 
-		childProcess.on('error', (error: Error) => {
-			if (progressStarted) {
-				if (multiBar) {
-					multiBar.remove(progressBar);
-				} else {
-					progressBar.stop();
-				}
-			}
+		proc.on('error', (error: Error) => {
+			if (barStarted) teardownBar(bar, multiBar);
 			reject(error);
 		});
 	});

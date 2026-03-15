@@ -1,41 +1,10 @@
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type * as cliProgress from 'cli-progress';
 import { debugLog, log, logError } from '../utils/debug';
+import { waitForFileStable } from '../utils/fs';
+import { spawnPromise } from '../utils/process';
 import { getLanguageCode } from './language';
-
-// Helper function to run spawn as a promise
-function spawnPromise(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-	return new Promise((resolve, reject) => {
-		const childProcess = spawn(command, args, {
-			shell: false,
-		});
-
-		let stdout = '';
-		let stderr = '';
-
-		childProcess.stdout.on('data', (data: Buffer) => {
-			stdout += data.toString();
-		});
-
-		childProcess.stderr.on('data', (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		childProcess.on('close', (code: number | null) => {
-			if (code === 0) {
-				resolve({ stdout, stderr });
-			} else {
-				reject(new Error(`Process exited with code ${code}. ${stderr || stdout}`));
-			}
-		});
-
-		childProcess.on('error', (error: Error) => {
-			reject(error);
-		});
-	});
-}
 
 export async function embedSubtitles(
 	videoPath: string,
@@ -50,21 +19,8 @@ export async function embedSubtitles(
 			return false;
 		}
 
-		// Verify video file is not empty and has reasonable size
-		const videoStats = fs.statSync(videoPath);
-		if (videoStats.size === 0) {
-			logError(`Error: Video file is empty: ${videoPath}`, multiBar);
-			return false;
-		}
-
-		// Check if file is still being written (size changed in last second)
-		const initialSize = videoStats.size;
-		await new Promise((resolve) => setTimeout(resolve, 1000));
-		const checkStats = fs.statSync(videoPath);
-		if (checkStats.size !== initialSize) {
-			log('Warning: Video file appears to still be writing. Waiting a bit longer...', multiBar);
-			await new Promise((resolve) => setTimeout(resolve, 2000));
-		}
+		// Wait until the video file has finished writing
+		await waitForFileStable(videoPath);
 
 		if (!subtitlePaths || subtitlePaths.length === 0) {
 			logError('Error: No subtitle files provided', multiBar);
@@ -251,27 +207,33 @@ export async function embedSubtitles(
 		);
 
 		// Delete all subtitle files after successful embedding
+		const baseFilename = path.basename(videoPath, videoExt);
+		const deletedPaths = new Set<string>();
 		for (const subPath of validSubtitlePaths) {
-			if (fs.existsSync(subPath)) {
+			try {
 				fs.unlinkSync(subPath);
+				deletedPaths.add(subPath);
 				debugLog(`Deleted subtitle file: ${subPath}`);
+			} catch {
+				// already gone — ignore
 			}
 		}
 
-		// Also delete any other .srt files with the same base name
-		const baseFilename = path.basename(videoPath, videoExt);
+		// Also delete any other .srt files with the same base name that weren't already removed
 		try {
 			const files = fs.readdirSync(dir);
-			const srtFiles = files.filter((f) => f.startsWith(baseFilename) && f.endsWith('.srt'));
-			for (const srtFile of srtFiles) {
-				const srtFilePath = path.join(dir, srtFile);
-				if (fs.existsSync(srtFilePath)) {
+			for (const f of files) {
+				if (!f.startsWith(baseFilename) || !f.endsWith('.srt')) continue;
+				const srtFilePath = path.join(dir, f);
+				if (deletedPaths.has(srtFilePath)) continue;
+				try {
 					fs.unlinkSync(srtFilePath);
 					debugLog(`Deleted subtitle file: ${srtFilePath}`);
+				} catch {
+					// already gone — ignore
 				}
 			}
-		} catch (_error) {
-			// Ignore errors when cleaning up subtitle files
+		} catch {
 			debugLog('Warning: Could not clean up all subtitle files');
 		}
 
