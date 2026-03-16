@@ -1,15 +1,26 @@
 import * as fs from 'node:fs';
 import 'dotenv/config';
+import React from 'react';
+import { render } from 'ink';
+import { InkApp } from './ui/InkApp';
+import { bus } from './ui/AppEventBus';
+import { inkLogger } from './ui/bridge/LoggerAdapter';
+import { setLoggerImpl } from './utils/logger';
 import domestikaAuth from './auth';
 import { readInputCSV } from './csv/input';
 import { loadProgress, saveProgress } from './csv/progress';
 import { scrapeSite } from './scraper/scraper';
 import type { CourseToProcess, DownloadOption } from './types';
 import { logMemoryUsage } from './utils/debug';
-import { logger } from './utils/logger';
 import { getN3u8DLPath } from './utils/paths';
 import { parseSubtitleLanguages } from './utils/subtitles';
 import { DOMESTIKA_URL_PATTERN, normalizeDomestikaUrl } from './utils/url';
+
+// ---------------------------------------------------------------------------
+// Install Ink-aware logger before anything else runs
+// ---------------------------------------------------------------------------
+
+setLoggerImpl(inkLogger);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,7 +52,7 @@ function resolveCoursesFromCsv(): CourseToProcess[] {
 	const csvCourses = readInputCSV();
 	if (!csvCourses?.length) return [];
 
-	logger.info(`Found ${csvCourses.length} courses in input.csv`);
+	inkLogger.info(`Found ${csvCourses.length} courses in input.csv`);
 	return csvCourses.map((course) =>
 		toCourseToProcess(
 			course.url,
@@ -77,8 +88,8 @@ function resolveCoursesFromArgs(): CourseToProcess[] {
 		throw new Error('Please provide valid Domestika course URLs');
 	}
 
-	logger.step('Using command-line arguments:');
-	logger.list([
+	inkLogger.step('Using command-line arguments:');
+	inkLogger.list([
 		`URLs: ${urls.join(', ')}`,
 		`Subtitles: ${subtitleLangs ? subtitleLangs.join(', ') : 'None'}`,
 		`Download: ${downloadOption}`,
@@ -87,15 +98,12 @@ function resolveCoursesFromArgs(): CourseToProcess[] {
 	return urls.map((url) => toCourseToProcess(url, subtitleLangs, downloadOption));
 }
 
-
 // ---------------------------------------------------------------------------
-// Main
+// Main — imperative orchestration (called after Ink UI mounts)
 // ---------------------------------------------------------------------------
 
-export async function main(): Promise<void> {
+async function main(): Promise<void> {
 	try {
-		logger.header('Domestika Downloader');
-
 		const auth = await domestikaAuth.getCookies();
 
 		let coursesToProcess: CourseToProcess[];
@@ -115,7 +123,8 @@ export async function main(): Promise<void> {
 		}
 
 		if (coursesToProcess.length === 0) {
-			logger.warn('No courses to process.');
+			inkLogger.warn('No courses to process.');
+			bus.emit('summary:done', { downloaded: 0, skipped: 0, failed: 0 });
 			return;
 		}
 
@@ -123,12 +132,24 @@ export async function main(): Promise<void> {
 		const completedVideos = loadProgress();
 		logMemoryUsage(`After loadProgress (${completedVideos.size} videos in set)`);
 
-		logger.header(`${coursesToProcess.length} course(s) to process`);
-		logger.list(coursesToProcess.map((c, i) => `${i + 1}. ${courseDisplayName(c)}`));
+		// Announce all courses to the UI
+		for (const course of coursesToProcess) {
+			bus.emit('course:status', {
+				courseUrl: course.url,
+				title: courseDisplayName(course),
+				status: 'pending',
+			});
+		}
 
 		for (const [i, course] of coursesToProcess.entries()) {
-			logger.header(`[${i + 1}/${coursesToProcess.length}] ${courseDisplayName(course)}`);
+			inkLogger.info(`[${i + 1}/${coursesToProcess.length}] ${courseDisplayName(course)}`);
 			logMemoryUsage(`Before processing course ${i + 1}`);
+
+			bus.emit('course:status', {
+				courseUrl: course.url,
+				title: courseDisplayName(course),
+				status: 'processing',
+			});
 
 			try {
 				saveProgress(course.url, course.courseTitle, 'processing');
@@ -143,26 +164,50 @@ export async function main(): Promise<void> {
 				);
 
 				logMemoryUsage(`After processing course ${i + 1}`);
-				logger.success(`Course done: ${courseDisplayName(course)}`);
+				inkLogger.success(`Course done: ${courseDisplayName(course)}`);
+
+				bus.emit('course:status', {
+					courseUrl: course.url,
+					title: courseDisplayName(course),
+					status: 'done',
+				});
 			} catch (error) {
 				const err = error as Error;
 				saveProgress(course.url, course.courseTitle, 'failed');
-				logger.error(`Course failed: ${courseDisplayName(course)} — ${err.message}`);
+				inkLogger.error(`Course failed: ${courseDisplayName(course)} — ${err.message}`);
+
+				bus.emit('course:status', {
+					courseUrl: course.url,
+					title: courseDisplayName(course),
+					status: 'failed',
+				});
+
 				logMemoryUsage(`After failed course ${i + 1}`);
 			}
 		}
 
-		logger.success('All courses have been processed');
+		inkLogger.success('All courses have been processed');
 	} catch (error) {
 		const err = error as Error;
-		logger.error(err.message);
-		process.exit(1);
+		bus.emit('error:fatal', { message: err.message });
 	}
 }
 
-if (require.main === module) {
-	main().catch((error: Error) => {
-		logger.error(`Fatal error: ${error}`);
-		process.exit(1);
-	});
+// ---------------------------------------------------------------------------
+// Entry point — render Ink UI, then start main() once mounted
+// ---------------------------------------------------------------------------
+
+// ESM entry guard
+{
+	const { waitUntilExit } = render(
+		React.createElement(InkApp, {
+			onReady: () => {
+				main().catch((error: Error) => {
+					bus.emit('error:fatal', { message: `Fatal error: ${error.message}` });
+				});
+			},
+		})
+	);
+
+	waitUntilExit().then(() => process.exit(0)).catch(() => process.exit(1));
 }

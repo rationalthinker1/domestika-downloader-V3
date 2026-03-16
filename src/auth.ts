@@ -1,6 +1,6 @@
 import * as path from 'node:path';
-import inquirer from 'inquirer';
 import 'dotenv/config';
+import { promptTextInput } from './ui/bridge/PromptBridge';
 import { updateEnvFile } from './utils/env';
 import { logger } from './utils/logger';
 
@@ -57,29 +57,25 @@ export class DomestikaAuth {
 			'Copy the value of: _credentials',
 		]);
 
-		const answers = await inquirer.prompt<{
-			sessionCookie?: string;
-			credentialsCookie?: string;
-		}>([
-			{
-				type: 'input',
-				name: 'sessionCookie',
+		if (forceUpdate || !this.cookies[0].value) {
+			const sessionCookie = await promptTextInput({
+				field: 'sessionCookie',
 				message: 'Enter the value of the _domestika_session cookie:',
-				when: () => forceUpdate || !this.cookies[0].value,
-			},
-			{
-				type: 'input',
-				name: 'credentialsCookie',
-				message: 'Enter the value of the _credentials cookie:',
-				when: () => forceUpdate || !this.credentialsToken,
-			},
-		]);
-
-		if (answers.sessionCookie) {
-			this.cookies[0].value = answers.sessionCookie;
+			});
+			if (sessionCookie) {
+				this.cookies[0].value = sessionCookie;
+			}
 		}
-		if (answers.credentialsCookie) {
-			this.credentialsToken = answers.credentialsCookie;
+
+		if (forceUpdate || !this.credentialsToken) {
+			const credentialsCookie = await promptTextInput({
+				field: 'credentialsCookie',
+				message: 'Enter the value of the _credentials cookie:',
+				mask: true,
+			});
+			if (credentialsCookie) {
+				this.credentialsToken = credentialsCookie;
+			}
 		}
 
 		this.saveCredentials();

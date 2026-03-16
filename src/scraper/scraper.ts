@@ -1,6 +1,4 @@
 import * as cheerio from 'cheerio';
-import * as cliProgress from 'cli-progress';
-import inquirer from 'inquirer';
 import puppeteer, { type HTTPRequest, type Page } from 'puppeteer';
 import type { Credentials } from '../auth';
 import domestikaAuth from '../auth';
@@ -13,6 +11,10 @@ import { getEnvInt } from '../utils/env';
 import { sanitizeTitle } from '../utils/strings';
 import { loadCourseMetadata, saveCourseMetadata } from './cache';
 import { fetchUnitVideoData } from './video-data';
+import { InkMultiBar } from '../ui/bridge/ProgressAdapter';
+import { promptConfirm, promptCheckbox } from '../ui/bridge/PromptBridge';
+import type { PromptCheckboxItem } from '../ui/AppEventBus';
+import { bus } from '../ui/AppEventBus';
 
 interface DownloadTask {
 	video: VideoData;
@@ -27,40 +29,32 @@ async function downloadSpecificVideos(
 	subtitleLangs: string[] | null,
 	completedVideos: Set<string>
 ): Promise<void> {
-	const videoChoices = allVideos.flatMap((unit) => {
-		const unitHeader = {
+	const videoChoices: PromptCheckboxItem[] = allVideos.flatMap((unit) => {
+		const unitHeader: PromptCheckboxItem = {
 			name: `Unit ${unit.unitNumber}: ${unit.title}`,
 			value: `unit_${unit.unitNumber}`,
 			checked: false,
+			isHeader: true,
 		};
 
-		const unitVideos = unit.videoData.map((video, index) => ({
+		const unitVideos: PromptCheckboxItem[] = unit.videoData.map((video, index) => ({
 			name: `    ${index + 1}. ${video.title}`,
 			value: {
 				unit: unit,
 				videoData: video,
 				index: index + 1,
 			},
-			short: video.title,
 		}));
 
 		return [unitHeader, ...unitVideos];
 	});
 
-	const selectedVideos = await inquirer.prompt<{ videosToDownload: (string | VideoSelection)[] }>(
-		[
-			{
-				type: 'checkbox',
-				name: 'videosToDownload',
-				message: 'Select complete units or specific videos:',
-				choices: videoChoices,
-				pageSize: 20,
-				loop: false,
-			},
-		]
-	);
+	const selectedVideos = await promptCheckbox<string | VideoSelection>({
+		message: 'Select complete units or specific videos:',
+		choices: videoChoices,
+	});
 
-	for (const selection of selectedVideos.videosToDownload) {
+	for (const selection of selectedVideos) {
 		if (typeof selection === 'string' && selection.startsWith('unit_')) {
 			const unitNumber = Number.parseInt(selection.split('_')[1], 10);
 			const unit = allVideos.find((u) => u.unitNumber === unitNumber);
@@ -196,16 +190,10 @@ async function promptCookieRefreshAndRetry(
 	courseTitle: string | null,
 	completedVideos: Set<string>
 ): Promise<void> {
-	const answer = await inquirer.prompt<{ updateCookies: boolean }>([
-		{
-			type: 'confirm',
-			name: 'updateCookies',
-			message: 'Do you want to update the cookies?',
-			default: true,
-		},
-	]);
+	bus.emit('error:cookie-expired', { courseUrl });
+	const updateCookies = await promptConfirm('Do you want to update the cookies?');
 
-	if (answer.updateCookies) {
+	if (updateCookies) {
 		await domestikaAuth.promptForCredentials(true);
 		return scrapeSite(
 			courseUrl,
@@ -241,6 +229,8 @@ export async function scrapeSite(
 		logger.info(`${allVideos.length} units loaded from cache`);
 	} else {
 		debugLog(`[CACHE] Cache miss or expired for course: ${courseUrl}`);
+
+		bus.emit('scrape:start', { courseUrl });
 
 		browser = await puppeteer.launch({
 			headless: true,
@@ -298,10 +288,14 @@ export async function scrapeSite(
 		logger.info(`Course: ${courseTitle}`);
 		logger.info(`${allVideos.length} units detected`);
 
+		bus.emit('scrape:units-found', { count: allVideos.length, courseUrl });
+
 		saveCourseMetadata(courseUrl, allVideos, courseTitle);
 		debugLog(`[CACHE] Saved metadata to cache for course: ${courseUrl}`);
 
 		await closeBrowser(page, requestHandler, browser);
+
+		bus.emit('scrape:done', { courseUrl });
 	}
 
 	if (downloadOption === 'specific') {
@@ -323,21 +317,9 @@ async function downloadAllVideos(
 	let downloadedCount = 0;
 	let skippedCount = 0;
 
-	const multiBar = new cliProgress.MultiBar({
-		format: '  {title} |{bar}| {percentage}% | ETA: {eta}s',
-		barCompleteChar: '\u2588',
-		barIncompleteChar: '\u2591',
-		hideCursor: true,
-		clearOnComplete: true,
-		stopOnComplete: true,
-		linewrap: false,
-		barsize: 40,
-		forceRedraw: true,
-		noTTYOutput: false,
-		notTTYSchedule: 2000,
-	});
+	const multiBar = new InkMultiBar();
 
-	setActiveMultiBar(multiBar);
+	setActiveMultiBar(multiBar as unknown as import('cli-progress').MultiBar);
 
 	// Build queue, counting skips in a single pass
 	const downloadQueue: DownloadTask[] = [];
@@ -346,7 +328,7 @@ async function downloadAllVideos(
 		for (let i = 0; i < unit.videoData.length; i++) {
 			const video = unit.videoData[i];
 			if (!video?.playbackURL) {
-				logger.error(`Invalid video data for ${unit.title} #${i}`, multiBar);
+				logger.error(`Invalid video data for ${unit.title} #${i}`);
 				continue;
 			}
 
@@ -399,7 +381,7 @@ async function downloadAllVideos(
 					task.videoIndex,
 					subtitleLangs,
 					task.unit.unitNumber,
-					multiBar,
+					multiBar as unknown as import('cli-progress').MultiBar,
 					courseUrl,
 					completedVideos
 				);
@@ -414,7 +396,7 @@ async function downloadAllVideos(
 				}
 			} catch (error) {
 				const err = error as Error;
-				logger.error(`Error in video ${task.video.title}: ${err.message}`, multiBar);
+				logger.error(`Error in video ${task.video.title}: ${err.message}`);
 				processedCount++;
 			}
 		})();
@@ -433,6 +415,8 @@ async function downloadAllVideos(
 	logMemoryUsage('After all downloads completed');
 
 	logger.success(`Download summary: ${downloadedCount} new, ${skippedCount} skipped`);
+
+	bus.emit('summary:done', { downloaded: downloadedCount, skipped: skippedCount, failed: 0 });
 
 	if (downloadedCount === 0 && skippedCount === 0) {
 		logger.error('Could not download any videos. This may be due to invalid cookies.');
